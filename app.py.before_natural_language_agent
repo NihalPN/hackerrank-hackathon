@@ -1,0 +1,1199 @@
+from __future__ import annotations
+
+import csv
+import json
+import re
+import sys
+from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+
+import gradio as gr
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "code"))
+
+from data.models import (
+    EventDirection,
+    EventStatus,
+    FinancialEvent,
+    FinancialProfile,
+    FinancialRequest,
+)
+from finance.currency import ExchangeRateTable
+from finance.v4.decision_v4 import decide_v4
+from agents.gemini.client import GeminiAgent
+
+
+# =========================================================
+# Paths / dataset
+# =========================================================
+
+DATASET_DIR = ROOT / "dataset"
+OUTPUT_PATH = DATASET_DIR / "output.csv"
+CACHE_PATH = ROOT / "runtime_cache" / "evidence.json"
+
+# Existing benchmark data remains available.
+from data.loader import load_dataset
+
+dataset = load_dataset(DATASET_DIR)
+rates = ExchangeRateTable(dataset.exchange_rates)
+
+GEMINI = GeminiAgent()
+
+
+# =========================================================
+# Generic helpers
+# =========================================================
+
+def enum_or_str(value):
+    return getattr(value, "value", value)
+
+
+def safe_str(value) -> str:
+    return "" if value is None else str(value)
+
+
+def parse_decimal(value) -> Decimal:
+    if value is None or safe_str(value).strip() == "":
+        raise ValueError("Value is required.")
+
+    try:
+        value = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("Value must be a valid number.") from exc
+
+    if value <= 0:
+        raise ValueError("Value must be greater than zero.")
+
+    return value
+
+
+def parse_date(value) -> date:
+    text = safe_str(value).strip()
+    if not text:
+        raise ValueError("Date is required.")
+
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(
+            "Use YYYY-MM-DD for dates."
+        ) from exc
+
+
+def format_money(currency: str, amount) -> str:
+    try:
+        return f"{currency} {Decimal(str(amount)):,.2f}"
+    except (InvalidOperation, ValueError, TypeError):
+        return f"{currency} {amount}"
+
+
+def status_headline(status: str) -> str:
+    return {
+        "affordable_now": "## 🟢 BUY NOW",
+        "affordable_with_plan": "## 🟡 BUY WITH PLAN",
+        "affordable_later": "## 🟠 WAIT",
+        "not_affordable": "## 🔴 NOT RECOMMENDED",
+    }.get(
+        status,
+        f"## {status.replace('_', ' ').upper()}",
+    )
+
+
+# =========================================================
+# Existing benchmark request mode
+# =========================================================
+
+def load_output_rows():
+    with OUTPUT_PATH.open(
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        return {
+            row["request_id"]: row
+            for row in csv.DictReader(f)
+        }
+
+
+def load_cache():
+    if not CACHE_PATH.exists():
+        return {}
+
+    try:
+        return json.loads(
+            CACHE_PATH.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        return {}
+
+
+output_rows = load_output_rows()
+evidence_cache = load_cache()
+
+request_ids = sorted(dataset.requests.keys())
+
+
+def existing_request_result(request_id):
+    if not request_id:
+        return (
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+
+    request = dataset.requests.get(request_id)
+    row = output_rows.get(request_id)
+
+    if request is None or row is None:
+        return (
+            request_id,
+            "Request not found.",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+
+    cached = evidence_cache.get(
+        request_id,
+        {},
+    )
+
+    facts = cached.get(
+        "facts",
+        [],
+    ) or []
+
+    if facts:
+        evidence = "\n".join(
+            f"- {f.get('fact_type', 'fact')}: "
+            f"{f.get('value', '')}"
+            for f in facts[:8]
+        )
+    elif cached.get("error"):
+        evidence = (
+            "⚠️ Gemini evidence unavailable. "
+            "Deterministic fallback used."
+        )
+    else:
+        evidence = (
+            "No unstructured evidence was required."
+        )
+
+    status = row["affordability_status"]
+
+    decision = (
+        f"{status_headline(status)}\n\n"
+        f"**Safe amount:** {row['amount_safe_to_pay']}\n\n"
+        f"**Recommended method:** "
+        f"{row['recommended_payment_method']}\n\n"
+        f"**Payment plan:** "
+        f"{row['payment_plan'] or 'None'}\n\n"
+        f"**Earliest full payment:** "
+        f"{row['earliest_date_for_full_payment'] or 'N/A'}\n\n"
+        f"**Spending changes:** "
+        f"{row['spending_changes_needed'] or 'None'}\n\n"
+        f"**Explanation:** "
+        f"{row['decision_explanation']}"
+    )
+
+    return (
+        request_id,
+        request.request_text,
+        row["amount_safe_to_pay"],
+        status,
+        row["recommended_payment_method"],
+        row["payment_plan"],
+        evidence,
+        decision,
+    )
+
+
+# =========================================================
+# Custom agent parser
+# =========================================================
+
+CUSTOM_SYSTEM_PROMPT = """
+You are the request-understanding component of a financial
+affordability agent.
+
+Extract only what the user explicitly states.
+
+Return JSON only:
+
+{
+  "amount": "numeric amount or null",
+  "currency": "ISO-like currency code or null",
+  "desired_date": "YYYY-MM-DD or null",
+  "request_type": "purchase|bill|transfer|debt|other",
+  "allows_partial_payment": true,
+  "description": "concise description",
+  "facts": [
+    {
+      "fact_type": "amount|date|currency|description|other",
+      "value": "...",
+      "confidence": 0.0
+    }
+  ]
+}
+
+Never invent missing values.
+Never calculate affordability.
+Never recommend a payment method.
+"""
+
+
+def local_parse_request(text: str):
+    currency_amount = re.search(
+        r"\b("
+        r"IDR|INR|ZAR|USD|EUR|GBP|AUD|CAD"
+        r")\s*"
+        r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+        text or "",
+        re.IGNORECASE,
+    )
+
+    amount = None
+    currency = None
+
+    if currency_amount:
+        currency = currency_amount.group(1).upper()
+        amount = Decimal(
+            currency_amount.group(2).replace(",", "")
+        )
+
+    iso_date = re.search(
+        r"\b(20\d{2}-\d{2}-\d{2})\b",
+        text or "",
+    )
+
+    desired_date = (
+        iso_date.group(1)
+        if iso_date
+        else None
+    )
+
+    lowered = (text or "").lower()
+
+    if any(
+        x in lowered
+        for x in (
+            "laptop",
+            "phone",
+            "computer",
+            "buy",
+            "purchase",
+        )
+    ):
+        request_type = "purchase"
+    elif any(
+        x in lowered
+        for x in (
+            "rent",
+            "utility",
+            "bill",
+        )
+    ):
+        request_type = "bill"
+    elif any(
+        x in lowered
+        for x in (
+            "loan",
+            "debt",
+            "repay",
+        )
+    ):
+        request_type = "debt"
+    elif any(
+        x in lowered
+        for x in (
+            "transfer",
+            "send",
+            "family",
+        )
+    ):
+        request_type = "transfer"
+    else:
+        request_type = "other"
+
+    return {
+        "amount": amount,
+        "currency": currency,
+        "desired_date": desired_date,
+        "request_type": request_type,
+        "allows_partial_payment": (
+            "partial" in lowered
+            or "part of it" in lowered
+        ),
+        "description": text.strip(),
+        "facts": [],
+        "source": "local_fallback",
+    }
+
+
+def parse_custom_request(text: str):
+    """
+    Gemini remains the primary request-understanding agent.
+    Local parsing is only the deterministic fallback.
+    """
+
+    text = safe_str(text).strip()
+
+    if not text:
+        raise ValueError(
+            "Tell the agent what you want to pay."
+        )
+
+    # Gemini is the primary path.
+    try:
+        result = GEMINI.extract(
+            prompt=(
+                CUSTOM_SYSTEM_PROMPT
+                + "\n\nUSER REQUEST\n"
+                + text
+            ),
+            images=(),
+        )
+
+        raw = getattr(
+            result,
+            "facts",
+            (),
+        )
+
+        # The current Gemini extraction client returns
+        # facts rather than a separate parser object.
+        extracted = {}
+
+        for fact in raw:
+            fact_type = safe_str(
+                fact.get("fact_type")
+            ).lower()
+            value = safe_str(
+                fact.get("value")
+            )
+
+            if fact_type == "amount":
+                match = re.search(
+                    r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+                    value,
+                )
+                if match:
+                    extracted["amount"] = Decimal(
+                        match.group(1).replace(",", "")
+                    )
+
+                currency = re.search(
+                    r"\b(IDR|INR|ZAR|USD|EUR|GBP|AUD|CAD)\b",
+                    value,
+                    re.IGNORECASE,
+                )
+
+                if currency:
+                    extracted["currency"] = (
+                        currency.group(1).upper()
+                    )
+
+            elif fact_type == "date":
+                iso = re.search(
+                    r"\b20\d{2}-\d{2}-\d{2}\b",
+                    value,
+                )
+                if iso:
+                    extracted["desired_date"] = (
+                        iso.group(0)
+                    )
+
+            elif fact_type == "description":
+                extracted["description"] = value
+
+        fallback = local_parse_request(text)
+
+        extracted.setdefault(
+            "currency",
+            fallback["currency"],
+        )
+        extracted.setdefault(
+            "amount",
+            fallback["amount"],
+        )
+        extracted.setdefault(
+            "desired_date",
+            fallback["desired_date"],
+        )
+        extracted.setdefault(
+            "request_type",
+            fallback["request_type"],
+        )
+        extracted.setdefault(
+            "allows_partial_payment",
+            fallback["allows_partial_payment"],
+        )
+        extracted.setdefault(
+            "description",
+            text,
+        )
+
+        if extracted.get("amount") is None:
+            raise ValueError(
+                "Gemini could not identify a purchase amount. "
+                "Please state the amount explicitly."
+            )
+
+        extracted["source"] = "gemini"
+        extracted["facts"] = list(raw)
+
+        return extracted
+
+    except Exception as exc:
+        # IMPORTANT:
+        # Gemini failure does not kill the financial decision.
+        fallback = local_parse_request(text)
+
+        if fallback["amount"] is None:
+            raise ValueError(
+                "Gemini was unavailable and the local fallback "
+                "could not identify an amount. "
+                "Please include an amount such as "
+                "'ZAR 37,114'."
+            ) from exc
+
+        fallback["fallback_reason"] = (
+            f"Gemini unavailable: {type(exc).__name__}"
+        )
+
+        return fallback
+
+
+# =========================================================
+# Custom financial state
+# =========================================================
+
+def build_custom_profile(
+    balance: Decimal,
+    minimum_balance: Decimal,
+    currency: str,
+):
+    """
+    Build a temporary read-only profile for the custom user.
+
+    The user supplies their own current financial state.
+    """
+
+    return FinancialProfile(
+        user_id="custom_user",
+        home_currency=currency,
+        current_available_balance=balance,
+        minimum_balance_to_keep=minimum_balance,
+        financial_priorities="custom user request",
+        protected_categories=(),
+        reducible_categories=(),
+        stoppable_categories=(),
+        payment_methods_user_will_consider=(
+            "full_payment",
+            "partial_payment",
+            "installments",
+        ),
+        max_installment_months=12,
+    )
+
+
+def build_custom_events(
+    user_id: str,
+    start_date: date,
+    future_income,
+    future_expenses,
+    currency: str,
+):
+    events = {}
+
+    # Optional future cash flows.
+    if future_income:
+        events["custom_income"] = FinancialEvent(
+            event_id="custom_income",
+            user_id=user_id,
+            event_type="income",
+            description="User-entered future income",
+            category="income",
+            direction=EventDirection.CREDIT,
+            amount=future_income,
+            currency=currency,
+            event_date=start_date,
+            settlement_date=start_date,
+            status=EventStatus.SCHEDULED,
+            linked_event_id=None,
+            flexibility="fixed",
+            minimum_allowed_amount=None,
+        )
+
+    if future_expenses:
+        events["custom_expense"] = FinancialEvent(
+            event_id="custom_expense",
+            user_id=user_id,
+            event_type="expense",
+            description="User-entered future expense",
+            category="expense",
+            direction=EventDirection.DEBIT,
+            amount=future_expenses,
+            currency=currency,
+            event_date=start_date,
+            settlement_date=start_date,
+            status=EventStatus.SCHEDULED,
+            linked_event_id=None,
+            flexibility="fixed",
+            minimum_allowed_amount=None,
+        )
+
+    return events
+
+
+# =========================================================
+# Custom request UI
+# =========================================================
+
+def custom_window_text(
+    balance,
+    minimum_balance,
+    currency,
+):
+    try:
+        b = parse_decimal(balance)
+        m = parse_decimal(minimum_balance)
+    except Exception:
+        return (
+            "Enter a valid account balance and "
+            "minimum protected balance."
+        )
+
+    if m > b:
+        return (
+            "⚠️ Minimum protected balance cannot be "
+            "greater than the current account balance."
+        )
+
+    today = date.today()
+    horizon = today + timedelta(days=90)
+
+    return (
+        f"**Current balance:** "
+        f"{format_money(currency, b)}  \n"
+        f"**Minimum protected:** "
+        f"{format_money(currency, m)}  \n"
+        f"**Forecast:** "
+        f"`{today}` → `{horizon}`"
+    )
+
+
+def custom_analyze(
+    balance,
+    minimum_balance,
+    currency,
+    request_text,
+    desired_date,
+    future_income,
+    future_expenses,
+):
+    try:
+        currency = safe_str(
+            currency
+        ).strip().upper()
+
+        if not currency:
+            raise ValueError(
+                "Enter your account currency."
+            )
+
+        balance = parse_decimal(
+            balance
+        )
+
+        minimum_balance = parse_decimal(
+            minimum_balance
+        )
+
+        if minimum_balance > balance:
+            raise ValueError(
+                "Minimum protected balance cannot be "
+                "greater than current balance."
+            )
+
+        # ---------------------------------------------
+        # Gemini extracts the request.
+        # ---------------------------------------------
+
+        parsed = parse_custom_request(
+            request_text
+        )
+
+        amount = parsed["amount"]
+
+        request_currency = (
+            parsed.get("currency")
+            or currency
+        )
+
+        if request_currency != currency:
+            raise ValueError(
+                f"The request uses {request_currency}, "
+                f"but the account is denominated in "
+                f"{currency}. "
+                f"Please use the same currency."
+            )
+
+        # ---------------------------------------------
+        # Date
+        # ---------------------------------------------
+
+        today = date.today()
+
+        if desired_date.strip():
+            completion_date = parse_date(
+                desired_date
+            )
+        elif parsed.get("desired_date"):
+            completion_date = parse_date(
+                parsed["desired_date"]
+            )
+        else:
+            completion_date = today
+
+        horizon_end = (
+            today + timedelta(days=90)
+        )
+
+        if not (
+            today
+            <= completion_date
+            <= horizon_end
+        ):
+            raise ValueError(
+                "Completion date must be between "
+                f"{today} and {horizon_end}."
+            )
+
+        # ---------------------------------------------
+        # Optional future state
+        # ---------------------------------------------
+
+        income = Decimal("0")
+        expenses = Decimal("0")
+
+        if safe_str(
+            future_income
+        ).strip():
+            income = parse_decimal(
+                future_income
+            )
+
+        if safe_str(
+            future_expenses
+        ).strip():
+            expenses = parse_decimal(
+                future_expenses
+            )
+
+        profile = build_custom_profile(
+            balance=balance,
+            minimum_balance=minimum_balance,
+            currency=currency,
+        )
+
+        events = build_custom_events(
+            user_id="custom_user",
+            start_date=today,
+            future_income=income,
+            future_expenses=expenses,
+            currency=currency,
+        )
+
+        request = FinancialRequest(
+            request_id="custom_request",
+            user_id="custom_user",
+            request_date=today,
+            request_type=parsed.get(
+                "request_type",
+                "other",
+            ),
+            requested_amount=amount,
+            desired_completion_date=(
+                completion_date
+            ),
+            allows_partial_payment=bool(
+                parsed.get(
+                    "allows_partial_payment",
+                    False,
+                )
+            ),
+            request_text=request_text.strip(),
+        )
+
+        # ---------------------------------------------
+        # Deterministic financial authority
+        # ---------------------------------------------
+
+        decision = decide_v4(
+            events=events,
+            profile=profile,
+            request=request,
+            payment_options=[],
+            exchange_rates=rates,
+        )
+
+        status = safe_str(
+            enum_or_str(
+                decision.affordability_status
+            )
+        )
+
+        method = safe_str(
+            enum_or_str(
+                decision.recommended_payment_method
+            )
+        )
+
+        plan = "; ".join(
+            f"{p.date.isoformat()}: {p.amount}"
+            for p in decision.payment_plan
+        ) or "None"
+
+        earliest = (
+            decision.earliest_date_for_full_payment.isoformat()
+            if decision.earliest_date_for_full_payment
+            else "N/A"
+        )
+
+        changes = "; ".join(
+            safe_str(x)
+            for x in decision.spending_changes_needed
+            if safe_str(x)
+        ) or "None"
+
+        decision_explanation = (
+            decision.decision_explanation
+            .replace(
+                "None of the available payment options keeps "
+                "the required minimum balance protected across "
+                "the forecast.",
+                "The requested amount cannot be paid while "
+                "keeping the required minimum balance protected "
+                "across the forecast.",
+            )
+        )
+
+        source = parsed.get(
+            "source",
+            "unknown",
+        )
+
+        # ---------------------------------------------
+        # Agent result
+        # ---------------------------------------------
+
+        if source == "gemini":
+            agent_note = (
+                "🧠 **Gemini agent:** "
+                "request understood successfully."
+            )
+        else:
+            agent_note = (
+                "🛡️ **Gemini fallback:** "
+                "Gemini was unavailable, so the validated "
+                "local parser was used."
+            )
+
+        decision_text = (
+            f"{status_headline(status)}\n\n"
+
+            f"{agent_note}\n\n"
+
+            f"**Requested amount:** "
+            f"{format_money(currency, amount)}\n\n"
+
+            f"**Current account balance:** "
+            f"{format_money(currency, balance)}\n\n"
+
+            f"**Minimum protected balance:** "
+            f"{format_money(currency, minimum_balance)}\n\n"
+
+            f"**Requested completion:** "
+            f"`{completion_date}`\n\n"
+
+            f"**Safe amount:** "
+            f"{format_money(currency, decision.amount_safe_to_pay)}\n\n"
+
+            f"**Status:** `{status}`\n\n"
+
+            f"**Recommended method:** `{method}`\n\n"
+
+            f"**Payment plan:** {plan}\n\n"
+
+            f"**Earliest full payment:** `{earliest}`\n\n"
+
+            f"**Spending changes:** {changes}\n\n"
+
+            f"**Explanation:** "
+            f"{decision_explanation}"
+        )
+
+        guardrails = (
+            "### Guardrails\n\n"
+            "- User-entered balance is isolated to this "
+            "custom simulation.\n"
+            "- Minimum protected balance is enforced.\n"
+            "- Requested amount is extracted from the request "
+            "rather than entered twice.\n"
+            "- Currency must match the account currency.\n"
+            "- Completion date is constrained to 90 days.\n"
+            "- Gemini can interpret the request but cannot "
+            "override the financial engine.\n"
+            "- Financial calculations use Decimal.\n"
+            "- Gemini failure triggers deterministic fallback."
+        )
+
+        return (
+            status,
+            format_money(
+                currency,
+                amount,
+            ),
+            format_money(
+                currency,
+                decision.amount_safe_to_pay,
+            ),
+            method,
+            plan,
+            earliest,
+            changes,
+            decision_text,
+            guardrails,
+        )
+
+    except Exception as exc:
+        return (
+            "INPUT_ERROR",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "### Validation error\n\n"
+            f"**{type(exc).__name__}:** {exc}",
+        )
+
+
+# =========================================================
+# Gradio
+# =========================================================
+
+with gr.Blocks(
+    title="Buy or Wait?"
+) as demo:
+
+    gr.Markdown(
+        """
+# 💰 Buy or Wait?
+
+### AI financial affordability agent
+
+**Gemini understands the request and evidence.  
+The deterministic financial engine makes the affordability decision.**
+
+For custom requests, enter your own current account state.
+"""
+    )
+
+    with gr.Tabs():
+
+        # =================================================
+        # Existing benchmark
+        # =================================================
+
+        with gr.Tab("Existing request"):
+
+            existing_dropdown = gr.Dropdown(
+                choices=request_ids,
+                value=(
+                    request_ids[0]
+                    if request_ids
+                    else None
+                ),
+                label="Benchmark request",
+            )
+
+            existing_request = gr.Textbox(
+                label="User request",
+                lines=3,
+                interactive=False,
+            )
+
+            with gr.Row():
+
+                existing_safe = gr.Textbox(
+                    label="Safe amount",
+                    interactive=False,
+                )
+
+                existing_status = gr.Textbox(
+                    label="Affordability",
+                    interactive=False,
+                )
+
+                existing_method = gr.Textbox(
+                    label="Recommended method",
+                    interactive=False,
+                )
+
+            existing_plan = gr.Textbox(
+                label="Payment plan",
+                interactive=False,
+            )
+
+            with gr.Row():
+                existing_evidence = gr.Markdown()
+                existing_decision = gr.Markdown()
+
+            existing_dropdown.change(
+                existing_request_result,
+                inputs=existing_dropdown,
+                outputs=[
+                    existing_dropdown,
+                    existing_request,
+                    existing_safe,
+                    existing_status,
+                    existing_method,
+                    existing_plan,
+                    existing_evidence,
+                    existing_decision,
+                ],
+            )
+
+            demo.load(
+                existing_request_result,
+                inputs=existing_dropdown,
+                outputs=[
+                    existing_dropdown,
+                    existing_request,
+                    existing_safe,
+                    existing_status,
+                    existing_method,
+                    existing_plan,
+                    existing_evidence,
+                    existing_decision,
+                ],
+            )
+
+        # =================================================
+        # Custom agent
+        # =================================================
+
+        with gr.Tab("Ask your own request"):
+
+            gr.Markdown(
+                """
+### Your financial state
+
+Enter **your own current account balance** and the
+minimum balance you refuse to fall below.
+
+Then describe what you want to pay in natural language.
+The Gemini agent extracts the requested amount and intent.
+You do **not** need to type the purchase amount twice.
+"""
+            )
+
+            with gr.Row():
+
+                account_balance = gr.Number(
+                    label="Current account balance",
+                    minimum=0,
+                    precision=2,
+                )
+
+                minimum_balance = gr.Number(
+                    label="Minimum balance to keep",
+                    minimum=0,
+                    precision=2,
+                )
+
+                account_currency = gr.Textbox(
+                    label="Account currency",
+                    value="ZAR",
+                )
+
+            financial_state = gr.Markdown(
+                "Enter your account information."
+            )
+
+            def show_state(
+                balance,
+                minimum,
+                currency,
+            ):
+                try:
+                    return custom_window_text(
+                        balance,
+                        minimum,
+                        currency,
+                    )
+                except Exception as exc:
+                    return f"⚠️ {exc}"
+
+            account_balance.change(
+                show_state,
+                inputs=[
+                    account_balance,
+                    minimum_balance,
+                    account_currency,
+                ],
+                outputs=financial_state,
+            )
+
+            minimum_balance.change(
+                show_state,
+                inputs=[
+                    account_balance,
+                    minimum_balance,
+                    account_currency,
+                ],
+                outputs=financial_state,
+            )
+
+            account_currency.change(
+                show_state,
+                inputs=[
+                    account_balance,
+                    minimum_balance,
+                    account_currency,
+                ],
+                outputs=financial_state,
+            )
+
+            gr.Markdown(
+                """
+### What are you planning to pay?
+"""
+            )
+
+            request_text = gr.Textbox(
+                label="Your request",
+                placeholder=(
+                    "I'm considering a ZAR 37,114 laptop. "
+                    "How much can I safely cover today?"
+                ),
+                lines=4,
+            )
+
+            with gr.Row():
+
+                desired_date = gr.Textbox(
+                    label="Desired completion date "
+                    "(optional)",
+                    placeholder="YYYY-MM-DD",
+                )
+
+            with gr.Row():
+
+                future_income = gr.Textbox(
+                    label="Known future income "
+                    "(optional)",
+                    placeholder="Example: 25000",
+                )
+
+                future_expenses = gr.Textbox(
+                    label="Known future expense "
+                    "(optional)",
+                    placeholder="Example: 12000",
+                )
+
+            analyze = gr.Button(
+                "Analyze with AI",
+                variant="primary",
+                size="lg",
+            )
+
+            with gr.Row():
+
+                parsed_status = gr.Textbox(
+                    label="Affordability",
+                    interactive=False,
+                )
+
+                parsed_requested = gr.Textbox(
+                    label="Detected request amount",
+                    interactive=False,
+                )
+
+                parsed_safe = gr.Textbox(
+                    label="Safe amount",
+                    interactive=False,
+                )
+
+                parsed_method = gr.Textbox(
+                    label="Recommended method",
+                    interactive=False,
+                )
+
+            parsed_plan = gr.Textbox(
+                label="Payment plan",
+                interactive=False,
+            )
+
+            parsed_earliest = gr.Textbox(
+                label="Earliest full payment",
+                interactive=False,
+            )
+
+            parsed_changes = gr.Textbox(
+                label="Spending changes",
+                interactive=False,
+            )
+
+            with gr.Row():
+
+                parsed_decision = gr.Markdown()
+
+                parsed_guardrails = gr.Markdown()
+
+            analyze.click(
+                custom_analyze,
+                inputs=[
+                    account_balance,
+                    minimum_balance,
+                    account_currency,
+                    request_text,
+                    desired_date,
+                    future_income,
+                    future_expenses,
+                ],
+                outputs=[
+                    parsed_status,
+                    parsed_requested,
+                    parsed_safe,
+                    parsed_method,
+                    parsed_plan,
+                    parsed_earliest,
+                    parsed_changes,
+                    parsed_decision,
+                    parsed_guardrails,
+                ],
+            )
+
+
+if __name__ == "__main__":
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        share=False,
+    )

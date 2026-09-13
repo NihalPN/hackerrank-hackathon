@@ -1,0 +1,1971 @@
+from __future__ import annotations
+
+import csv
+import json
+import re
+import sys
+from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+
+import gradio as gr
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "code"))
+
+from agents.gemini.client import GeminiAgent
+from data.loader import load_dataset
+from data.models import (
+    EventDirection,
+    EventStatus,
+    FinancialEvent,
+    FinancialProfile,
+    FinancialRequest,
+    PaymentMethod,
+    PaymentOption,
+)
+from finance.currency import ExchangeRateTable
+from finance.v4.decision_v4 import decide_v4
+
+
+# =========================================================
+# DATASET / SERVICES
+# =========================================================
+
+DATASET_DIR = ROOT / "dataset"
+OUTPUT_PATH = DATASET_DIR / "output.csv"
+CACHE_PATH = ROOT / "runtime_cache" / "evidence.json"
+
+dataset = load_dataset(DATASET_DIR)
+rates = ExchangeRateTable(dataset.exchange_rates)
+
+GEMINI = GeminiAgent()
+
+
+# =========================================================
+# GENERIC HELPERS
+# =========================================================
+
+def enum_or_str(value):
+    return getattr(value, "value", value)
+
+
+def as_text(value) -> str:
+    return "" if value is None else str(value)
+
+
+def parse_decimal(
+    value,
+    field_name: str,
+    allow_zero: bool = True,
+) -> Decimal:
+    if value is None or not as_text(value).strip():
+        raise ValueError(
+            f"{field_name} is required."
+        )
+
+    try:
+        result = Decimal(str(value))
+    except (
+        InvalidOperation,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise ValueError(
+            f"{field_name} must be a valid number."
+        ) from exc
+
+    if allow_zero:
+        if result < Decimal("0"):
+            raise ValueError(
+                f"{field_name} cannot be negative."
+            )
+    else:
+        if result <= Decimal("0"):
+            raise ValueError(
+                f"{field_name} must be greater than zero."
+            )
+
+    return result
+
+
+def parse_iso_date(value) -> date:
+    text = as_text(value).strip()
+
+    if not text:
+        raise ValueError(
+            "Date is required."
+        )
+
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(
+            "Use YYYY-MM-DD for dates."
+        ) from exc
+
+
+def money(currency: str, value) -> str:
+    try:
+        return f"{currency} {Decimal(str(value)):,.2f}"
+    except Exception:
+        return f"{currency} {value}"
+
+
+def status_headline(status: str) -> str:
+    return {
+        "affordable_now": "## 🟢 BUY NOW",
+        "affordable_with_plan": "## 🟡 BUY WITH PLAN",
+        "affordable_later": "## 🟠 WAIT",
+        "not_affordable": "## 🔴 NOT RECOMMENDED",
+    }.get(
+        status,
+        f"## {status.replace('_', ' ').upper()}",
+    )
+
+
+def load_output_rows():
+    with OUTPUT_PATH.open(
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        return {
+            row["request_id"]: row
+            for row in csv.DictReader(f)
+        }
+
+
+def load_evidence_cache():
+    if not CACHE_PATH.exists():
+        return {}
+
+    try:
+        return json.loads(
+            CACHE_PATH.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        return {}
+
+
+OUTPUT_ROWS = load_output_rows()
+EVIDENCE_CACHE = load_evidence_cache()
+
+REQUEST_IDS = sorted(dataset.requests.keys())
+
+
+# =========================================================
+# EXISTING BENCHMARK MODE
+# =========================================================
+
+def existing_request_result(request_id):
+    if not request_id:
+        return (
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+
+    request = dataset.requests.get(request_id)
+    row = OUTPUT_ROWS.get(request_id)
+
+    if request is None or row is None:
+        return (
+            request_id,
+            "Request not found.",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+
+    cached = EVIDENCE_CACHE.get(
+        request_id,
+        {},
+    )
+
+    facts = cached.get("facts", []) or []
+
+    if facts:
+        evidence = "\n".join(
+            f"- {fact.get('fact_type', 'fact')}: "
+            f"{fact.get('value', '')}"
+            for fact in facts[:8]
+        )
+    elif cached.get("error"):
+        evidence = (
+            "⚠️ Gemini evidence was unavailable. "
+            "The deterministic fallback was used."
+        )
+    else:
+        evidence = (
+            "No unstructured evidence was required."
+        )
+
+    status = as_text(
+        row["affordability_status"]
+    )
+
+    decision = (
+        f"{status_headline(status)}\n\n"
+        f"**Safe amount:** "
+        f"{row['amount_safe_to_pay']}\n\n"
+        f"**Recommended method:** "
+        f"{row['recommended_payment_method']}\n\n"
+        f"**Payment plan:** "
+        f"{row['payment_plan'] or 'None'}\n\n"
+        f"**Earliest full payment:** "
+        f"{row['earliest_date_for_full_payment'] or 'N/A'}\n\n"
+        f"**Spending changes:** "
+        f"{row['spending_changes_needed'] or 'None'}\n\n"
+        f"**Explanation:** "
+        f"{row['decision_explanation']}"
+    )
+
+    return (
+        request_id,
+        request.request_text,
+        row["amount_safe_to_pay"],
+        status,
+        row["recommended_payment_method"],
+        row["payment_plan"],
+        evidence,
+        decision,
+    )
+
+
+# =========================================================
+# NATURAL-LANGUAGE AGENT
+# =========================================================
+
+AGENT_PROMPT = """
+You are the request-understanding component of a financial
+affordability agent.
+
+Extract ONLY information explicitly stated by the user.
+
+Return JSON only:
+
+{
+  "facts": [
+    {
+      "fact_type":
+        "balance|minimum_balance|amount|currency|date|income|expense|installment_count|payment_frequency|financing_fee|description|request_type",
+      "value": "...",
+      "evidence_text": "...",
+      "confidence": 0.0
+    }
+  ]
+}
+
+Rules:
+- Never calculate affordability.
+- Never decide BUY or WAIT.
+- Never invent a missing value.
+- Treat account balance and purchase amount as DIFFERENT facts.
+- Treat minimum protected balance as DIFFERENT from account balance.
+- A proposed installment count must be explicitly stated.
+- A financing fee must be explicitly stated.
+- If the user says "today", the date fact may be "today".
+- If the user says "monthly", payment_frequency may be "monthly".
+"""
+
+
+CURRENCY_RE = re.compile(
+    r"\b("
+    r"IDR|INR|ZAR|USD|EUR|GBP|AUD|CAD"
+    r")\s*"
+    r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
+
+NUMBER_RE = re.compile(
+    r"\b([0-9][0-9,]*(?:\.[0-9]+)?)\b"
+)
+
+
+def _money_matches(text: str):
+    pattern = re.compile(
+        r"\b("
+        r"IDR|INR|ZAR|USD|EUR|GBP|AUD|CAD"
+        r")\s*"
+        r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+        re.IGNORECASE,
+    )
+
+    results = []
+
+    for match in pattern.finditer(text or ""):
+        try:
+            results.append(
+                {
+                    "currency": match.group(1).upper(),
+                    "amount": Decimal(
+                        match.group(2).replace(",", "")
+                    ),
+                    "start": match.start(),
+                    "end": match.end(),
+                    "text": match.group(0),
+                }
+            )
+        except InvalidOperation:
+            continue
+
+    return results
+
+
+def _context(text: str, start: int, end: int, window: int = 90):
+    left = max(0, start - window)
+    right = min(len(text), end + window)
+    return text[left:right].lower()
+
+
+def _classify_money_roles(text: str):
+    """
+    Assign semantic roles to monetary mentions.
+
+    Priority:
+    1. Explicit account balance
+    2. Explicit minimum/reserve
+    3. Explicit income
+    4. Explicit expense
+    5. Purchase/request amount
+    """
+
+    matches = _money_matches(text)
+
+    balance = None
+    minimum_balance = None
+    requested_amount = None
+    currency = None
+    income = None
+    expense = None
+
+    for item in matches:
+        amount = item.get("amount", item.get("value"))
+        item_currency = item["currency"]
+        context = _context(
+            text,
+            item["start"],
+            item["end"],
+        )
+
+        if currency is None:
+            currency = item_currency
+
+        # -----------------------------
+        # Account balance
+        # -----------------------------
+        if (
+            re.search(
+                r"\b("
+                r"i have|"
+                r"i've got|"
+                r"my balance is|"
+                r"account balance|"
+                r"current balance|"
+                r"cash balance|"
+                r"available balance"
+                r")\b",
+                context,
+            )
+            and balance is None
+        ):
+            balance = amount
+            continue
+
+        # -----------------------------
+        # Minimum protected balance
+        # -----------------------------
+        if (
+            re.search(
+                r"\b("
+                r"keep|"
+                r"leave|"
+                r"reserve|"
+                r"untouched|"
+                r"minimum|"
+                r"at least"
+                r")\b",
+                context,
+            )
+            and re.search(
+                r"\b("
+                r"keep|"
+                r"leave|"
+                r"reserve|"
+                r"untouched|"
+                r"minimum|"
+                r"protected"
+                r")\b",
+                context,
+            )
+        ):
+            if minimum_balance is None:
+                minimum_balance = amount
+                continue
+
+        # -----------------------------
+        # Future income
+        # -----------------------------
+        if re.search(
+            r"\b("
+            r"salary|"
+            r"income|"
+            r"receive|"
+            r"get paid|"
+            r"paycheck|"
+            r"bonus"
+            r")\b",
+            context,
+        ):
+            if income is None:
+                income = amount
+                continue
+
+        # -----------------------------
+        # Future expense
+        # -----------------------------
+        if re.search(
+            r"\b("
+            r"rent|"
+            r"bill|"
+            r"expense|"
+            r"due|"
+            r"owe|"
+            r"payment due"
+            r")\b",
+            context,
+        ):
+            if expense is None:
+                expense = amount
+                continue
+
+    # -----------------------------
+    # Requested purchase amount
+    #
+    # Look for explicit purchase
+    # language.
+    # -----------------------------
+    for item in matches:
+        context = _context(
+            text,
+            item["start"],
+            item["end"],
+            window=120,
+        )
+
+        if re.search(
+            r"\b("
+            r"buy|"
+            r"purchase|"
+            r"considering|"
+            r"looking at|"
+            r"costs?|"
+            r"price|"
+            r"laptop|"
+            r"phone|"
+            r"computer|"
+            r"car|"
+            r"item"
+            r")\b",
+            context,
+        ):
+            requested_amount = item.get("amount", item.get("value"))
+            currency = item["currency"]
+            break
+
+    # Last-resort behavior:
+    #
+    # If there is exactly one money value and no
+    # balance/request distinction, treat it as the request.
+    if (
+        requested_amount is None
+        and len(matches) == 1
+    ):
+        requested_amount = matches[0]["amount"]
+        currency = matches[0]["currency"]
+
+    return {
+        "balance": balance,
+        "minimum_balance": minimum_balance,
+        "amount": requested_amount,
+        "currency": currency,
+        "income": income,
+        "expense": expense,
+        "money_mentions": matches,
+    }
+
+
+
+def local_parse_request(text):
+    """Deterministic fallback parser for the custom natural-language demo."""
+    import re
+    from decimal import Decimal, InvalidOperation
+
+    text = (text or "").strip()
+
+    result = {
+        "facts": [],
+        "parser": "local",
+        "missing": [],
+    }
+
+    if not text:
+        result["missing"] = [
+            "current account balance",
+            "minimum protected balance",
+            "requested purchase amount",
+            "currency",
+        ]
+        return result
+
+    # ------------------------------------------------------------
+    # Monetary token
+    # ------------------------------------------------------------
+    money = r'(?P<currency>\$|€|£|₹|[A-Za-z]{3})\s*(?P<amount>\d+(?:,\d{3})*(?:\.\d+)?)'
+
+    symbol_currency = {
+        "$": "USD",
+        "€": "EUR",
+        "£": "GBP",
+        "₹": "INR",
+    }
+
+    def add_fact(fact_type, currency, amount, confidence=0.97, source=None):
+        if amount is None:
+            return
+
+        result["facts"].append({
+            "fact_type": fact_type,
+            "value": str(amount),
+            "currency": currency,
+            "confidence": confidence,
+            "source_text": source or text,
+        })
+
+    def parse_match(match):
+        if not match:
+            return None, None
+
+        raw_currency = match.group("currency")
+        raw_amount = match.group("amount").replace(",", "")
+
+        try:
+            amount = Decimal(raw_amount)
+        except (InvalidOperation, ValueError):
+            return None, None
+
+        currency = symbol_currency.get(
+            raw_currency,
+            raw_currency.upper()
+        )
+
+        return currency, amount
+
+    # ------------------------------------------------------------
+    # 1. CURRENT BALANCE
+    #
+    # Deliberately match the amount immediately associated with
+    # phrases such as "I have", "my balance", "in my account".
+    # This prevents a later "keep ... untouched" amount from
+    # stealing the balance role.
+    # ------------------------------------------------------------
+    balance_patterns = [
+        rf'\b(?:I\s+have|I''ve\s+got)\s+{money}(?=\s+(?:in|on)\s+(?:my|the)\s+(?:account|bank|savings))',
+        rf'\b(?:my|current|available)\s+balance\s+is\s+{money}',
+        rf'\b(?:I\s+have|I''ve\s+got)\s+{money}',
+        rf'{money}\s+(?:is\s+)?(?:in|on)\s+my\s+(?:account|bank|savings)',
+    ]
+
+    balance = None
+
+    for pattern in balance_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            currency, amount = parse_match(match)
+            if amount is not None:
+                balance = (currency, amount, match.group(0))
+                break
+
+    # ------------------------------------------------------------
+    # 2. MINIMUM PROTECTED BALANCE
+    # ------------------------------------------------------------
+    minimum_patterns = [
+        rf'\bkeep\s+{money}\b',
+        rf'\bleave\s+{money}\b',
+        rf'\breserve\s+{money}\b',
+        rf'\bprotect\s+{money}\b',
+        rf'\bretain\s+{money}\b',
+        rf'\bminimum(?:\s+balance)?\s+(?:is\s+)?{money}\b',
+        rf'\bat\s+least\s+{money}\b',
+        rf'{money}\s+(?:untouched|reserved|protected)\b',
+    ]
+
+    minimum = None
+
+    for pattern in minimum_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            currency, amount = parse_match(match)
+            if amount is not None:
+                minimum = (currency, amount, match.group(0))
+                break
+
+    # ------------------------------------------------------------
+    # 3. REQUEST / PURCHASE AMOUNT
+    #
+    # Match phrases that explicitly describe the thing being bought.
+    # ------------------------------------------------------------
+    request_patterns = [
+        rf'\bconsidering\s+(?:a|an)?\s*{money}\b',
+        rf'\b(?:buy|purchase)\s+(?:a|an)?\s*{money}\b',
+        rf'\b(?:costs?|price\s+is|priced\s+at)\s+{money}\b',
+        rf'\blooking\s+at\s+(?:a|an)?\s*{money}\b',
+        rf'\b(?:laptop|phone|computer|car)\s*(?:costs?|is)\s*{money}\b',
+        rf'\b{money}\s+(?:laptop|phone|computer|car)\b',
+    ]
+
+    requested = None
+
+    for pattern in request_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            currency, amount = parse_match(match)
+            if amount is not None:
+                requested = (currency, amount, match.group(0))
+                break
+
+    # ------------------------------------------------------------
+    # 4. OTHER EXPLICIT MONEY ROLES
+    # ------------------------------------------------------------
+    income_patterns = [
+        rf'(?:salary|income|bonus|paycheck)\s*(?:of|is)?\s*{money}',
+        rf'(?:receive|get paid|getting paid)\s+{money}',
+    ]
+
+    income = None
+
+    for pattern in income_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            currency, amount = parse_match(match)
+            if amount is not None:
+                income = (currency, amount, match.group(0))
+                break
+
+    expense_patterns = [
+        rf'(?:rent|bill|expense|debt|payment)\s*(?:of|is|due)?\s*{money}',
+        rf'(?:owe|due)\s+{money}',
+    ]
+
+    expense = None
+
+    for pattern in expense_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            currency, amount = parse_match(match)
+            if amount is not None:
+                expense = (currency, amount, match.group(0))
+                break
+
+    fee_patterns = [
+        rf'(?:fee|fees|interest|charge|financing\s+cost)\s*(?:of|is)?\s*{money}',
+    ]
+
+    fee = None
+
+    for pattern in fee_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            currency, amount = parse_match(match)
+            if amount is not None:
+                fee = (currency, amount, match.group(0))
+                break
+
+    # ------------------------------------------------------------
+    # Add explicit facts
+    # ------------------------------------------------------------
+    if balance:
+        add_fact(
+            "balance",
+            balance[0],
+            balance[1],
+            source=balance[2],
+        )
+
+    if minimum:
+        add_fact(
+            "minimum_balance",
+            minimum[0],
+            minimum[1],
+            source=minimum[2],
+        )
+
+    if requested:
+        add_fact(
+            "amount",
+            requested[0],
+            requested[1],
+            source=requested[2],
+        )
+
+    if income:
+        add_fact(
+            "income",
+            income[0],
+            income[1],
+            source=income[2],
+        )
+
+    if expense:
+        add_fact(
+            "expense",
+            expense[0],
+            expense[1],
+            source=expense[2],
+        )
+
+    if fee:
+        add_fact(
+            "financing_fee",
+            fee[0],
+            fee[1],
+            source=fee[2],
+        )
+
+    # ------------------------------------------------------------
+    # Currency
+    # ------------------------------------------------------------
+    currency_match = re.search(
+        r'\b(?:USD|EUR|GBP|INR|ZAR|IDR)\b|[$€£₹]',
+        text,
+        re.IGNORECASE,
+    )
+
+    if currency_match:
+        raw = currency_match.group(0)
+
+        result["facts"].append({
+            "fact_type": "currency",
+            "value": symbol_currency.get(raw, raw.upper()),
+            "currency": symbol_currency.get(raw, raw.upper()),
+            "confidence": 0.99,
+            "source_text": currency_match.group(0),
+        })
+
+    # ------------------------------------------------------------
+    # Installment plan — ONLY when explicitly stated
+    # ------------------------------------------------------------
+    installment_count = None
+
+    installment_patterns = [
+        r'\b(\d+)\s+monthly\s+installments?\b',
+        r'\b(\d+)\s+monthly\s+payments?\b',
+        r'\b(\d+)\s+month(?:ly)?\s+installments?\b',
+        r'\bpay\s+(?:it|this|that)\s+in\s+(\d+)\s+payments?\b',
+        r'\b(\d+)\s+installments?\b',
+    ]
+
+    for pattern in installment_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            installment_count = int(match.group(1))
+            break
+
+    if installment_count is not None:
+        result["facts"].append({
+            "fact_type": "installment_count",
+            "value": str(installment_count),
+            "currency": None,
+            "confidence": 0.99,
+            "source_text": match.group(0),
+        })
+
+        frequency = (
+            "monthly"
+            if re.search(r'\bmonthly\b|\bmonth\b', text, re.IGNORECASE)
+            else "weekly"
+            if re.search(r'\bweekly\b|\bweek\b', text, re.IGNORECASE)
+            else "unknown"
+        )
+
+        result["facts"].append({
+            "fact_type": "payment_frequency",
+            "value": frequency,
+            "currency": None,
+            "confidence": 0.99,
+            "source_text": match.group(0),
+        })
+
+    # ------------------------------------------------------------
+    # Request type
+    # ------------------------------------------------------------
+    low = text.lower()
+
+    if any(word in low for word in (
+        "laptop", "phone", "computer", "car", "buy", "purchase",
+        "considering",
+    )):
+        request_type = "purchase"
+    elif any(word in low for word in ("trip", "travel", "flight", "hotel")):
+        request_type = "travel"
+    elif any(word in low for word in ("course", "tuition", "education")):
+        request_type = "education"
+    elif any(word in low for word in ("rent", "house", "deposit")):
+        request_type = "housing"
+    else:
+        request_type = "purchase"
+
+    result["facts"].append({
+        "fact_type": "request_type",
+        "value": request_type,
+        "currency": None,
+        "confidence": 0.90,
+        "source_text": text,
+    })
+
+    # ------------------------------------------------------------
+
+    # ------------------------------------------------------------
+    # Backward-compatible fields for the existing Gradio flow.
+    #
+    # Older custom-request code expects:
+    #   parsed["amount"]
+    #   parsed["balance"]
+    #   parsed["minimum_balance"]
+    #   parsed["currency"]
+    #   parsed["installment_count"]
+    #   parsed["payment_frequency"]
+    #
+    # Keep those fields while retaining the structured `facts`
+    # representation above.
+    # ------------------------------------------------------------
+
+    def _fact_value(kind):
+        for fact in result["facts"]:
+            if fact.get("fact_type") == kind:
+                return fact.get("value")
+        return None
+
+    def _fact_currency(kind):
+        for fact in result["facts"]:
+            if fact.get("fact_type") == kind:
+                return fact.get("currency")
+        return None
+
+    result["amount"] = _fact_value("amount")
+    result["balance"] = _fact_value("balance")
+    result["minimum_balance"] = _fact_value("minimum_balance")
+
+    result["currency"] = (
+        _fact_value("currency")
+        or _fact_currency("amount")
+        or _fact_currency("balance")
+        or _fact_currency("minimum_balance")
+    )
+
+    result["installment_count"] = _fact_value("installment_count")
+    result["payment_frequency"] = _fact_value("payment_frequency")
+    result["financing_fee"] = _fact_value("financing_fee")
+
+    result["request_type"] = _fact_value("request_type") or "purchase"
+
+    # Missing required information
+    # ------------------------------------------------------------
+    if requested is None:
+        result["missing"].append("requested purchase amount")
+
+    if balance is None:
+        result["missing"].append("current account balance")
+
+    if minimum is None:
+        result["missing"].append("minimum protected balance")
+
+    if currency_match is None:
+        result["missing"].append("currency")
+
+    return result
+
+
+
+def extract_agent_facts(text: str) -> dict:
+    text = as_text(text).strip()
+
+    if not text:
+        raise ValueError(
+            "Tell the agent what you want to pay "
+            "and, when possible, your financial situation."
+        )
+
+    try:
+        result = GEMINI.extract(
+            prompt=(
+                AGENT_PROMPT
+                + "\n\nUSER INPUT\n"
+                + text
+            ),
+            images=(),
+        )
+
+        facts = list(
+            getattr(
+                result,
+                "facts",
+                (),
+            )
+        )
+
+        if facts:
+            return {
+                "facts": facts,
+                "source": "gemini",
+            }
+
+    except Exception as exc:
+        fallback = local_parse_request(text)
+        fallback["fallback_reason"] = (
+            f"Gemini unavailable: "
+            f"{type(exc).__name__}"
+        )
+        return fallback
+
+    fallback = local_parse_request(text)
+    fallback["fallback_reason"] = (
+        "Gemini returned no usable facts."
+    )
+
+    # ------------------------------------------------------------
+    # Normalize Gemini output into the legacy custom-Gradio schema.
+    # The downstream UI expects parsed["amount"], etc.
+    # Gemini/local extraction may instead return {"facts": [...]}.
+    # ------------------------------------------------------------
+    if isinstance(result, dict) and "facts" in result:
+        facts = result.get("facts") or []
+
+        def _get(kind):
+            for fact in facts:
+                if isinstance(fact, dict):
+                    if str(fact.get("fact_type", "")).lower() == kind:
+                        return fact
+            return None
+
+        f_amount = _get("amount") or _get("requested_amount")
+        f_balance = _get("balance") or _get("current_balance")
+        f_minimum = (
+            _get("minimum_balance")
+            or _get("minimum_protected")
+            or _get("protected_balance")
+        )
+        f_currency = _get("currency")
+        f_installments = _get("installment_count")
+        f_frequency = _get("payment_frequency")
+        f_fee = _get("financing_fee") or _get("fee")
+        f_type = _get("request_type")
+
+        def _value(f):
+            return f.get("value") if isinstance(f, dict) else None
+
+        def _currency(f):
+            return f.get("currency") if isinstance(f, dict) else None
+
+        result["amount"] = _value(f_amount)
+        result["balance"] = _value(f_balance)
+        result["minimum_balance"] = _value(f_minimum)
+
+        result["currency"] = (
+            _value(f_currency)
+            or _currency(f_amount)
+            or _currency(f_balance)
+            or _currency(f_minimum)
+        )
+
+        result["installment_count"] = _value(f_installments)
+        result["payment_frequency"] = _value(f_frequency)
+        result["financing_fee"] = _value(f_fee)
+        result["request_type"] = _value(f_type) or "purchase"
+
+    # If Gemini returns the already-normalized schema, leave it untouched.
+    result.setdefault("amount", None)
+    result.setdefault("balance", None)
+    result.setdefault("minimum_balance", None)
+    result.setdefault("currency", None)
+    result.setdefault("installment_count", None)
+    result.setdefault("payment_frequency", None)
+    result.setdefault("financing_fee", None)
+    result.setdefault("request_type", "purchase")
+
+    return fallback
+
+
+
+def classify_facts(facts):
+    """Normalize Gemini/local facts into the custom-agent state."""
+    result = {
+        "balance": None,
+        "minimum_balance": None,
+        "requested_amount": None,
+        "currency": None,
+        "completion_date": None,
+        "request_type": "purchase",
+        "income": [],
+        "expense": [],
+        "installment_count": None,
+        "payment_frequency": None,
+        "financing_fee": None,
+    }
+
+    for fact in facts or []:
+        if not isinstance(fact, dict):
+            continue
+
+        kind = str(fact.get("fact_type", "")).strip().lower()
+        value = fact.get("value")
+
+        if value in (None, "", "null"):
+            continue
+
+        if kind in {
+            "balance",
+            "current_balance",
+            "account_balance",
+        }:
+            result["balance"] = value
+
+        elif kind in {
+            "minimum_balance",
+            "minimum_protected",
+            "minimum_protected_balance",
+            "protected_balance",
+        }:
+            result["minimum_balance"] = value
+
+        elif kind in {
+            "amount",
+            "requested_amount",
+            "purchase_amount",
+            "request_amount",
+        }:
+            result["requested_amount"] = value
+
+        elif kind == "currency":
+            result["currency"] = str(value).upper()
+
+        elif kind in {
+            "date",
+            "completion_date",
+            "desired_completion_date",
+        }:
+            result["completion_date"] = str(value)
+
+        elif kind == "request_type":
+            result["request_type"] = str(value)
+
+        elif kind == "income":
+            result["income"].append(value)
+
+        elif kind == "expense":
+            result["expense"].append(value)
+
+        elif kind in {
+            "installment_count",
+            "number_of_payments",
+        }:
+            try:
+                result["installment_count"] = int(value)
+            except (TypeError, ValueError):
+                pass
+
+        elif kind in {
+            "payment_frequency",
+            "frequency",
+        }:
+            result["payment_frequency"] = str(value).lower()
+
+        elif kind in {
+            "financing_fee",
+            "fee",
+        }:
+            result["financing_fee"] = value
+
+    return result
+
+
+# =========================================================
+# CUSTOM PROFILE / EVENTS / OPTIONS
+# =========================================================
+
+def make_custom_profile(
+    balance: Decimal,
+    minimum_balance: Decimal,
+    currency: str,
+):
+    return FinancialProfile(
+        user_id="custom_user",
+        home_currency=currency,
+        current_available_balance=balance,
+        minimum_balance_to_keep=minimum_balance,
+        financial_priorities=(
+            "custom affordability request"
+        ),
+        protected_categories=(),
+        reducible_categories=(),
+        stoppable_categories=(),
+        payment_methods_user_will_consider=(
+            "full_payment",
+            "partial_payment",
+            "installments",
+        ),
+        max_installment_months=12,
+    )
+
+
+def make_custom_events(
+    user_id: str,
+    start_date: date,
+    currency: str,
+    future_income: Decimal | None,
+    future_expense: Decimal | None,
+):
+    events = {}
+
+    if future_income is not None:
+        events["custom_income"] = FinancialEvent(
+            event_id="custom_income",
+            user_id=user_id,
+            event_type="income",
+            description="User-entered future income",
+            category="income",
+            direction=EventDirection.CREDIT,
+            amount=future_income,
+            currency=currency,
+            event_date=start_date,
+            settlement_date=start_date,
+            status=EventStatus.SCHEDULED,
+            linked_event_id=None,
+            flexibility="fixed",
+            minimum_allowed_amount=None,
+        )
+
+    if future_expense is not None:
+        events["custom_expense"] = FinancialEvent(
+            event_id="custom_expense",
+            user_id=user_id,
+            event_type="expense",
+            description="User-entered future expense",
+            category="expense",
+            direction=EventDirection.DEBIT,
+            amount=future_expense,
+            currency=currency,
+            event_date=start_date,
+            settlement_date=start_date,
+            status=EventStatus.SCHEDULED,
+            linked_event_id=None,
+            flexibility="fixed",
+            minimum_allowed_amount=None,
+        )
+
+    return events
+
+
+def build_payment_options(
+    request_id: str,
+    amount: Decimal,
+    start_date: date,
+    desired_date: date,
+    installment_count,
+    payment_frequency,
+    financing_fee,
+):
+    options = []
+
+    # Always permit evaluation of full payment.
+    options.append(
+        PaymentOption(
+            payment_option_id="custom_full",
+            request_id=request_id,
+            payment_method=PaymentMethod.FULL_PAYMENT,
+            payment_amount=amount,
+            number_of_payments=1,
+            first_payment_date=desired_date,
+            payment_frequency_days=0,
+            financing_fee=Decimal("0"),
+            total_payable_amount=amount,
+        )
+    )
+
+    # Only create an installment option when the user
+    # explicitly provides a payment count.
+    if installment_count:
+        if installment_count < 2:
+            raise ValueError(
+                "Installment count must be at least 2."
+            )
+
+        if installment_count > 12:
+            raise ValueError(
+                "For this demo, installment plans are "
+                "limited to 12 payments."
+            )
+
+        if payment_frequency == "weekly":
+            frequency_days = 7
+        else:
+            # Monthly is the safe default only when the
+            # user explicitly provided a count but omitted
+            # frequency.
+            frequency_days = 30
+
+        total = amount
+
+        if financing_fee is not None:
+            if financing_fee < 0:
+                raise ValueError(
+                    "Financing fee cannot be negative."
+                )
+            total += financing_fee
+
+        payment_amount = (
+            total
+            / Decimal(installment_count)
+        )
+
+        options.append(
+            PaymentOption(
+                payment_option_id="custom_installments",
+                request_id=request_id,
+                payment_method=PaymentMethod.INSTALLMENTS,
+                payment_amount=payment_amount,
+                number_of_payments=installment_count,
+                first_payment_date=desired_date,
+                payment_frequency_days=frequency_days,
+                financing_fee=(
+                    financing_fee
+                    if financing_fee is not None
+                    else Decimal("0")
+                ),
+                total_payable_amount=total,
+            )
+        )
+
+    return options
+
+
+# =========================================================
+# CUSTOM AGENT FLOW
+# =========================================================
+
+def analyze_custom_request(
+    request_text,
+    override_balance,
+    override_minimum,
+    override_currency,
+    override_date,
+    override_income,
+    override_expense,
+):
+    try:
+        parsed = classify_facts(
+            extract_agent_facts(
+                request_text
+            )
+        )
+
+        # -------------------------------------------------
+        # Structured fields are optional overrides.
+        # They are not mandatory duplicate inputs.
+        # -------------------------------------------------
+
+        if (
+            override_balance is not None
+            and as_text(
+                override_balance
+            ).strip()
+        ):
+            parsed["balance"] = parse_decimal(
+                override_balance,
+                "Current account balance",
+            )
+
+        if (
+            override_minimum is not None
+            and as_text(
+                override_minimum
+            ).strip()
+        ):
+            parsed["minimum_balance"] = parse_decimal(
+                override_minimum,
+                "Minimum balance to keep",
+            )
+
+        if as_text(
+            override_currency
+        ).strip():
+            parsed["currency"] = (
+                as_text(
+                    override_currency
+                )
+                .strip()
+                .upper()
+            )
+
+        if as_text(
+            override_date
+        ).strip():
+            parsed["desired_date"] = (
+                parse_iso_date(
+                    override_date
+                )
+            )
+
+        future_income = None
+        future_expense = None
+
+        if as_text(
+            override_income
+        ).strip():
+            future_income = parse_decimal(
+                override_income,
+                "Known future income",
+            )
+
+        if as_text(
+            override_expense
+        ).strip():
+            future_expense = parse_decimal(
+                override_expense,
+                "Known future expense",
+            )
+
+        # -------------------------------------------------
+        # Missing-information agent behavior.
+        # -------------------------------------------------
+
+        missing = []
+
+        if parsed["amount"] is None:
+            missing.append(
+                "the amount you want to pay"
+            )
+
+        if parsed["balance"] is None:
+            missing.append(
+                "your current account balance"
+            )
+
+        if parsed["minimum_balance"] is None:
+            missing.append(
+                "the minimum balance you want protected"
+            )
+
+        if parsed["currency"] is None:
+            missing.append(
+                "your account currency"
+            )
+
+        if missing:
+            bullet_list = "\n".join(
+                f"- {item}"
+                for item in missing
+            )
+
+            detected = []
+
+            if parsed["amount"] is not None:
+                detected.append(
+                    f"Requested amount: "
+                    f"{money(parsed['currency'] or '?', parsed['amount'])}"
+                )
+
+            if parsed["balance"] is not None:
+                detected.append(
+                    f"Current balance: "
+                    f"{money(parsed['currency'] or '?', parsed['balance'])}"
+                )
+
+            if parsed["minimum_balance"] is not None:
+                detected.append(
+                    f"Minimum protected: "
+                    f"{money(parsed['currency'] or '?', parsed['minimum_balance'])}"
+                )
+
+            detected_text = (
+                "\n".join(
+                    f"- {x}"
+                    for x in detected
+                )
+                if detected
+                else "- Nothing confidently detected yet."
+            )
+
+            source_label = (
+                "Gemini"
+                if parsed["source"] == "gemini"
+                else "local fallback"
+            )
+
+            return (
+                "NEEDS_INPUT",
+                detected_text,
+                (
+                    f"## 🟠 I NEED MORE INFORMATION\n\n"
+                    f"The {source_label} request parser "
+                    f"understood the following:\n\n"
+                    f"{detected_text}\n\n"
+                    f"Before I calculate affordability, "
+                    f"I need:\n\n"
+                    f"{bullet_list}\n\n"
+                    f"Put the missing information into the "
+                    f"same request or use the optional "
+                    f"advanced fields below."
+                ),
+                "",
+                "",
+                "",
+                "",
+                (
+                    "### Agent guardrail\n\n"
+                    "The system never invents financial "
+                    "information that the user did not provide."
+                ),
+            )
+
+        balance = parsed["balance"]
+        minimum_balance = parsed[
+            "minimum_balance"
+        ]
+        currency = parsed["currency"]
+        amount = parsed["amount"]
+
+        if minimum_balance > balance:
+            raise ValueError(
+                "Minimum protected balance cannot be "
+                "greater than the current account balance."
+            )
+
+        today = date.today()
+
+        desired_date = (
+            parsed["desired_date"]
+            or today
+        )
+
+        horizon_end = (
+            today + timedelta(days=90)
+        )
+
+        if not (
+            today
+            <= desired_date
+            <= horizon_end
+        ):
+            raise ValueError(
+                "Requested completion date must be "
+                f"between {today} and {horizon_end}."
+            )
+
+        # -------------------------------------------------
+        # Build temporary custom profile.
+        # -------------------------------------------------
+
+        profile = make_custom_profile(
+            balance=balance,
+            minimum_balance=minimum_balance,
+            currency=currency,
+        )
+
+        events = make_custom_events(
+            user_id="custom_user",
+            start_date=today,
+            currency=currency,
+            future_income=future_income,
+            future_expense=future_expense,
+        )
+
+        request = FinancialRequest(
+            request_id="custom_request",
+            user_id="custom_user",
+            request_date=today,
+            request_type=(
+                parsed["request_type"]
+                or "other"
+            ),
+            requested_amount=amount,
+            desired_completion_date=desired_date,
+            allows_partial_payment=(
+                parsed["installment_count"]
+                is not None
+            ),
+            request_text=request_text.strip(),
+        )
+
+        payment_options = build_payment_options(
+            request_id=request.request_id,
+            amount=amount,
+            start_date=today,
+            desired_date=desired_date,
+            installment_count=(
+                parsed["installment_count"]
+            ),
+            payment_frequency=(
+                parsed["payment_frequency"]
+            ),
+            financing_fee=(
+                parsed["financing_fee"]
+            ),
+        )
+
+        # -------------------------------------------------
+        # V4 remains the authority.
+        # -------------------------------------------------
+
+        decision = decide_v4(
+            events=events,
+            profile=profile,
+            request=request,
+            payment_options=payment_options,
+            exchange_rates=rates,
+        )
+
+        status = as_text(
+            enum_or_str(
+                decision.affordability_status
+            )
+        )
+
+        method = as_text(
+            enum_or_str(
+                decision.recommended_payment_method
+            )
+        )
+
+        plan = "; ".join(
+            f"{p.date.isoformat()}: {p.amount}"
+            for p in decision.payment_plan
+        ) or "None"
+
+        earliest = (
+            decision.earliest_date_for_full_payment.isoformat()
+            if decision.earliest_date_for_full_payment
+            else "N/A"
+        )
+
+        changes = "; ".join(
+            as_text(change)
+            for change in decision.spending_changes_needed
+            if as_text(change)
+        ) or "None"
+
+        explanation = as_text(
+            decision.decision_explanation
+        ).replace(
+            "None of the available payment options keeps "
+            "the required minimum balance protected across "
+            "the forecast.",
+            "The requested amount cannot be paid while "
+            "keeping the required minimum balance protected "
+            "across the forecast.",
+        )
+
+        source_label = (
+            "🧠 Gemini agent"
+            if parsed["source"] == "gemini"
+            else "🛡️ Gemini fallback"
+        )
+
+        detected = (
+            f"- Requested amount: "
+            f"{money(currency, amount)}\n"
+            f"- Current balance: "
+            f"{money(currency, balance)}\n"
+            f"- Minimum protected: "
+            f"{money(currency, minimum_balance)}\n"
+            f"- Currency: `{currency}`\n"
+            f"- Completion date: `{desired_date}`\n"
+            f"- Request type: `{parsed['request_type']}`"
+        )
+
+        if parsed["installment_count"]:
+            detected += (
+                f"\n- Proposed payments: "
+                f"{parsed['installment_count']}"
+            )
+
+        if parsed["payment_frequency"]:
+            detected += (
+                f"\n- Frequency: "
+                f"{parsed['payment_frequency']}"
+            )
+
+        decision_text = (
+            f"{status_headline(status)}\n\n"
+
+            f"{source_label}\n\n"
+
+            f"**Requested:** "
+            f"{money(currency, amount)}\n\n"
+
+            f"**Safe to pay today:** "
+            f"{money(currency, decision.amount_safe_to_pay)}\n\n"
+
+            f"**Current balance:** "
+            f"{money(currency, balance)}\n\n"
+
+            f"**Minimum protected:** "
+            f"{money(currency, minimum_balance)}\n\n"
+
+            f"**Completion:** `{desired_date}`\n\n"
+
+            f"**Recommended method:** "
+            f"`{method}`\n\n"
+
+            f"**Payment plan:** "
+            f"{plan}\n\n"
+
+            f"**Earliest full payment:** "
+            f"`{earliest}`\n\n"
+
+            f"**Spending changes:** "
+            f"{changes}\n\n"
+
+            f"**Explanation:** "
+            f"{explanation}"
+        )
+
+        guardrails = (
+            "### Agent guardrails\n\n"
+            f"- `{source_label}` handles request "
+            "understanding only.\n"
+            "- Missing financial facts are requested "
+            "instead of invented.\n"
+            "- Current balance and purchase amount are "
+            "separate concepts.\n"
+            "- Minimum protected balance is enforced.\n"
+            "- Currency must be consistent.\n"
+            "- Forecast is limited to 90 days.\n"
+            "- Installment plans are only created when "
+            "the user explicitly states a payment count.\n"
+            "- Financing fees are never invented.\n"
+            "- V4 is the final financial authority."
+        )
+
+        return (
+            status,
+            detected,
+            decision_text,
+            money(
+                currency,
+                amount,
+            ),
+            money(
+                currency,
+                decision.amount_safe_to_pay,
+            ),
+            method,
+            plan,
+            earliest,
+            changes,
+            guardrails,
+        )
+
+    except Exception as exc:
+        return (
+            "INPUT_ERROR",
+            "",
+            (
+                "### Validation error\n\n"
+                f"**{type(exc).__name__}:** "
+                f"{exc}"
+            ),
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+
+
+# =========================================================
+# UI
+# =========================================================
+
+with gr.Blocks(
+    title="Buy or Wait?"
+) as demo:
+
+    gr.Markdown(
+        """
+# 💰 Buy or Wait?
+
+### AI financial affordability agent
+
+**Gemini understands the request.  
+The deterministic financial engine makes the financial decision.**
+
+For a custom request, you can put your financial situation
+and purchase request into **one natural-language message**.
+The optional fields below are only for corrections or missing
+information — you do not need to type the purchase amount twice.
+"""
+    )
+
+    with gr.Tabs():
+
+        # =================================================
+        # Existing benchmark
+        # =================================================
+
+        with gr.Tab(
+            "Existing request"
+        ):
+
+            existing_dropdown = gr.Dropdown(
+                choices=REQUEST_IDS,
+                value=(
+                    REQUEST_IDS[0]
+                    if REQUEST_IDS
+                    else None
+                ),
+                label="Benchmark request",
+            )
+
+            existing_request = gr.Textbox(
+                label="User request",
+                lines=3,
+                interactive=False,
+            )
+
+            with gr.Row():
+
+                existing_safe = gr.Textbox(
+                    label="Safe amount",
+                    interactive=False,
+                )
+
+                existing_status = gr.Textbox(
+                    label="Affordability",
+                    interactive=False,
+                )
+
+                existing_method = gr.Textbox(
+                    label="Recommended method",
+                    interactive=False,
+                )
+
+            existing_plan = gr.Textbox(
+                label="Payment plan",
+                interactive=False,
+            )
+
+            with gr.Row():
+                existing_evidence = gr.Markdown()
+                existing_decision = gr.Markdown()
+
+            existing_dropdown.change(
+                existing_request_result,
+                inputs=existing_dropdown,
+                outputs=[
+                    existing_dropdown,
+                    existing_request,
+                    existing_safe,
+                    existing_status,
+                    existing_method,
+                    existing_plan,
+                    existing_evidence,
+                    existing_decision,
+                ],
+            )
+
+            demo.load(
+                existing_request_result,
+                inputs=existing_dropdown,
+                outputs=[
+                    existing_dropdown,
+                    existing_request,
+                    existing_safe,
+                    existing_status,
+                    existing_method,
+                    existing_plan,
+                    existing_evidence,
+                    existing_decision,
+                ],
+            )
+
+        # =================================================
+        # Natural language agent
+        # =================================================
+
+        with gr.Tab(
+            "Ask your own request"
+        ):
+
+            gr.Markdown(
+                """
+### Tell the agent what is going on
+
+You can write everything in one message.
+
+**Example**
+
+> I have ZAR 30,000 in my account and want to keep
+> ZAR 5,000 untouched. I'm considering a ZAR 33,114
+> laptop. I can pay it in 3 monthly installments.
+"""
+            )
+
+            request_text = gr.Textbox(
+                label="Your financial situation + request",
+                placeholder=(
+                    "I have ZAR 30,000 in my account "
+                    "and want to keep ZAR 5,000 untouched. "
+                    "I'm considering a ZAR 33,114 laptop. "
+                    "I can pay it in 3 monthly installments."
+                ),
+                lines=7,
+            )
+
+            analyze = gr.Button(
+                "Analyze with AI",
+                variant="primary",
+                size="lg",
+            )
+
+            gr.Markdown(
+                """
+### Optional advanced fields
+
+Use these only to correct or complete what the agent
+could not confidently extract. They are **not required**
+when the same information is already in your message.
+"""
+            )
+
+            with gr.Row():
+
+                override_balance = gr.Number(
+                    label="Current balance override",
+                    minimum=0,
+                    precision=2,
+                )
+
+                override_minimum = gr.Number(
+                    label="Minimum protected override",
+                    minimum=0,
+                    precision=2,
+                )
+
+                override_currency = gr.Textbox(
+                    label="Currency override",
+                    placeholder="ZAR",
+                )
+
+            with gr.Row():
+
+                override_date = gr.Textbox(
+                    label="Completion date override",
+                    placeholder="YYYY-MM-DD",
+                )
+
+                override_income = gr.Textbox(
+                    label="Known future income override",
+                    placeholder="Optional",
+                )
+
+                override_expense = gr.Textbox(
+                    label="Known future expense override",
+                    placeholder="Optional",
+                )
+
+            gr.Markdown(
+                "### Agent understanding"
+            )
+
+            parsed_status = gr.Textbox(
+                label="Agent state",
+                interactive=False,
+            )
+
+            detected = gr.Markdown()
+
+            with gr.Row():
+
+                requested_amount = gr.Textbox(
+                    label="Detected request amount",
+                    interactive=False,
+                )
+
+                safe_amount = gr.Textbox(
+                    label="Safe amount",
+                    interactive=False,
+                )
+
+                recommended_method = gr.Textbox(
+                    label="Recommended method",
+                    interactive=False,
+                )
+
+            payment_plan = gr.Textbox(
+                label="Payment plan",
+                interactive=False,
+            )
+
+            earliest_payment = gr.Textbox(
+                label="Earliest full payment",
+                interactive=False,
+            )
+
+            spending_changes = gr.Textbox(
+                label="Spending changes",
+                interactive=False,
+            )
+
+            with gr.Row():
+
+                decision = gr.Markdown()
+
+                guardrails = gr.Markdown()
+
+            analyze.click(
+                analyze_custom_request,
+
+                inputs=[
+                    request_text,
+                    override_balance,
+                    override_minimum,
+                    override_currency,
+                    override_date,
+                    override_income,
+                    override_expense,
+                ],
+
+                outputs=[
+                    parsed_status,
+                    detected,
+                    decision,
+                    requested_amount,
+                    safe_amount,
+                    recommended_method,
+                    payment_plan,
+                    earliest_payment,
+                    spending_changes,
+                    guardrails,
+                ],
+            )
+
+
+if __name__ == "__main__":
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        share=False,
+    )

@@ -1,6 +1,6 @@
 request_id,amount_safe_to_pay,affordability_status,recommended_payment_method,payment_plan,earliest_date_for_full_payment,spending_changes_needed,decision_explanation
 request_100,30871.27,affordable_with_plan,installments,2024-06-13:12866.19;2024-07-14:12866.19;2024-08-14:12866.19,2024-08-14,,Use the recommended payment plan. All payments remain above the required minimum balance.
-request_101,60552.55,affordable_later,wait,2025-11-14:143500,2025-11-14,,Wait until 2025-11-14 to make the full payment. Paying earlier would risk the required minimum balance.
+request_101,143500.00,affordable_now,full_payment,2025-11-03:143500,2025-11-03,,Pay 143500.00 today. The projected balance remains above the required minimum.
 request_102,1716.00,affordable_with_plan,installments,2026-04-05:594.88;2026-05-05:594.88;2026-06-04:594.88,2026-06-04,,Use the recommended payment plan. All payments remain above the required minimum balance.
 request_103,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_104,17204.00,affordable_now,full_payment,2025-02-04:17204,2025-02-04,,Pay 17204.00 today. The projected balance remains above the required minimum.
@@ -87,7 +87,7 @@ request_184,26732.00,not_affordable,not_recommended,,,,None of the available pay
 request_185,561.47,affordable_with_plan,partial_payment,2025-11-06:561.47;2025-11-14:695.83,2025-11-14,,Use the recommended payment plan. All payments remain above the required minimum balance.
 request_186,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_187,46958.50,affordable_with_plan,partial_payment,2024-09-05:46958.50;2024-09-13:140541.50,2024-09-13,,Use the recommended payment plan. All payments remain above the required minimum balance.
-request_188,354.30,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
+request_188,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_189,488.40,affordable_now,full_payment,2026-07-04:488.4,2026-07-04,,Pay 488.40 today. The projected balance remains above the required minimum.
 request_190,808.11,affordable_later,wait,2025-01-16:2557.5,2025-01-16,,Wait until 2025-01-16 to make the full payment. Paying earlier would risk the required minimum balance.
 request_191,664.40,affordable_now,full_payment,2025-05-03:664.4,2025-05-03,,Pay 664.40 today. The projected balance remains above the required minimum.
@@ -118,7 +118,7 @@ request_215,29986.00,affordable_with_plan,full_payment,2025-05-06:29986,2025-05-
 request_216,689.35,affordable_later,wait,2026-09-13:3332.4,2026-09-13,,Wait until 2026-09-13 to make the full payment. Paying earlier would risk the required minimum balance.
 request_217,25550.63,affordable_with_plan,installments,2024-03-19:12889.07;2024-04-19:12889.07;2024-05-20:12889.07,2024-05-20,,Use the recommended payment plan. All payments remain above the required minimum balance.
 request_218,28894411.74,affordable_with_plan,installments,2025-08-07:21195893.33;2025-09-04:21195893.33;2025-10-02:21195893.33,2025-10-02,,Use the recommended payment plan. All payments remain above the required minimum balance.
-request_219,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
+request_219,861.70,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_220,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_221,109800.00,affordable_now,full_payment,2025-11-03:109800,2025-11-03,,Pay 109800.00 today. The projected balance remains above the required minimum.
 request_222,34078.00,affordable_now,full_payment,2026-01-05:34078,2026-01-05,,Pay 34078.00 today. The projected balance remains above the required minimum.
@@ -155,7 +155,7 @@ request_252,6305274.65,affordable_later,wait,2026-08-14:28082000,2026-08-14,,Wai
 request_253,1651.69,affordable_with_plan,installments,2024-03-21:984.6;2024-04-21:984.6;2024-05-22:984.6,2024-05-22,,Use the recommended payment plan. All payments remain above the required minimum balance.
 request_254,1089.45,affordable_later,wait,2025-09-13:3535.2,2025-09-13,,Wait until 2025-09-13 to make the full payment. Paying earlier would risk the required minimum balance.
 request_255,3345000.00,affordable_now,full_payment,2026-04-06:3345000,2026-04-06,,Pay 3345000.00 today. The projected balance remains above the required minimum.
-request_256,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
+request_256,183249.61,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_257,798.42,affordable_later,wait,2025-11-15:1352.4,2025-11-15,,Wait until 2025-11-15 to make the full payment. Paying earlier would risk the required minimum balance.
 request_258,1113.60,affordable_now,full_payment,2026-01-07:1113.6,2026-01-07,,Pay 1113.60 today. The projected balance remains above the required minimum.
 request_259,496.37,affordable_later,wait,2024-10-14:935,2024-10-14,,Wait until 2024-10-14 to make the full payment. Paying earlier would risk the required minimum balance.
@@ -164,12 +164,12 @@ request_260,12646400.00,affordable_later,wait,2025-04-15:52079000,2025-04-15,,Wa
 request_261,1830.40,affordable_now,full_payment,2026-07-03:1830.4,2026-07-03,,Pay 1830.40 today. The projected balance remains above the required minimum.
 request_262,9236000.00,affordable_now,full_payment,2024-12-05:9236000,2024-12-05,,Pay 9236000.00 today. The projected balance remains above the required minimum.
 request_263,11586.44,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
-request_264,33761.06,affordable_later,wait,2026-05-14:111300,2026-05-14,,Wait until 2026-05-14 to make the full payment. Paying earlier would risk the required minimum balance.
+request_264,33761.06,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_265,45970.00,affordable_now,full_payment,2024-03-06:45970,2024-03-06,,Pay 45970.00 today. The projected balance remains above the required minimum.
 request_266,935.00,affordable_with_plan,installments,2025-08-03:324.13;2025-08-31:324.13;2025-09-28:324.13,2025-09-28,,Use the recommended payment plan. All payments remain above the required minimum balance.
 request_267,1816.63,affordable_with_plan,installments,2026-01-08:667.33;2026-02-07:667.33;2026-03-09:667.33,2026-03-09,,Use the recommended payment plan. All payments remain above the required minimum balance.
 request_268,1148.52,affordable_with_plan,installments,2024-06-14:841.22;2024-07-15:841.22;2024-08-15:841.22,2024-08-15,,Use the recommended payment plan. All payments remain above the required minimum balance.
-request_269,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
+request_269,10726.66,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_27,6670.00,affordable_now,full_payment,2026-07-05:6670,2026-07-05,,Pay 6670.00 today. The projected balance remains above the required minimum.
 request_270,288.77,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_271,27996.75,affordable_later,wait,2024-11-13:91300,2024-11-13,,Wait until 2024-11-13 to make the full payment. Paying earlier would risk the required minimum balance.
@@ -181,20 +181,20 @@ request_28,468.92,affordable_later,wait,2024-07-14:1302.4,2024-07-14,,Wait until
 request_29,31641.49,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_30,775.20,affordable_with_plan,installments,2026-04-06:268.74;2026-05-06:268.74;2026-06-05:268.74,2026-06-05,,Use the recommended payment plan. All payments remain above the required minimum balance.
 request_31,2204227.70,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
-request_32,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
+request_32,2687.32,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_33,65180.00,affordable_later,wait,2026-01-14:118000,2026-01-14,,Wait until 2026-01-14 to make the full payment. Paying earlier would risk the required minimum balance.
 request_34,129400.00,affordable_now,full_payment,2024-12-04:129400,2024-12-04,,Pay 129400.00 today. The projected balance remains above the required minimum.
 request_35,55433.16,affordable_later,wait,2025-12-16:212000,2025-12-16,,Wait until 2025-12-16 to make the full payment. Paying earlier would risk the required minimum balance.
-request_36,998.90,affordable_later,wait,2026-08-14:3954,2026-08-14,,Wait until 2026-08-14 to make the full payment. Paying earlier would risk the required minimum balance.
+request_36,998.90,affordable_later,wait,2026-07-15:3954,2026-07-15,,Wait until 2026-07-15 to make the full payment. Paying earlier would risk the required minimum balance.
 request_37,7220245.37,affordable_later,wait,2024-03-17:14649000,2024-03-17,,Wait until 2024-03-17 to make the full payment. Paying earlier would risk the required minimum balance.
 request_38,259.02,affordable_later,wait,2025-09-13:971.3,2025-09-13,,Wait until 2025-09-13 to make the full payment. Paying earlier would risk the required minimum balance.
 request_39,158670.34,affordable_later,wait,2026-04-15:208600,2026-04-15,,Wait until 2026-04-15 to make the full payment. Paying earlier would risk the required minimum balance.
 request_40,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_41,15526600.15,affordable_later,wait,2025-11-15:38760000,2025-11-15,,Wait until 2025-11-15 to make the full payment. Paying earlier would risk the required minimum balance.
 request_42,52100.00,affordable_now,full_payment,2026-01-05:52100,2026-01-05,,Pay 52100.00 today. The projected balance remains above the required minimum.
-request_43,10045190.49,affordable_later,wait,2024-11-12:43339000,2024-11-12,,Wait until 2024-11-12 to make the full payment. Paying earlier would risk the required minimum balance.
+request_43,10045190.49,affordable_later,wait,2024-09-15:43339000,2024-09-15,,Wait until 2024-09-15 to make the full payment. Paying earlier would risk the required minimum balance.
 request_44,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
-request_45,5589650.69,affordable_later,wait,2026-08-14:21983000,2026-08-14,,Wait until 2026-08-14 to make the full payment. Paying earlier would risk the required minimum balance.
+request_45,5589650.69,affordable_later,wait,2026-07-15:21983000,2026-07-15,,Wait until 2026-07-15 to make the full payment. Paying earlier would risk the required minimum balance.
 request_46,49450.00,affordable_with_plan,full_payment,2024-12-03:49450,2024-12-03,,Use the recommended payment plan. All payments remain above the required minimum balance.
 request_47,38114000.00,affordable_now,full_payment,2025-05-05:38114000,2025-05-05,,Pay 38114000.00 today. The projected balance remains above the required minimum.
 request_48,45700.00,affordable_now,full_payment,2026-07-25:45700,2026-07-25,,Pay 45700.00 today. The projected balance remains above the required minimum.
@@ -221,12 +221,12 @@ request_68,1598.66,affordable_with_plan,installments,2025-02-14:725.09;2025-03-1
 request_69,529.10,affordable_now,full_payment,2026-01-04:529.1,2026-01-04,,Pay 529.10 today. The projected balance remains above the required minimum.
 request_70,63075.81,affordable_later,wait,2025-01-16:243900,2025-01-16,,Wait until 2025-01-16 to make the full payment. Paying earlier would risk the required minimum balance.
 request_71,2482790.02,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
-request_72,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
+request_72,7172.70,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_73,71400.00,affordable_now,full_payment,2023-01-20:71400,2023-01-20,,Pay 71400.00 today. The projected balance remains above the required minimum.
 request_74,5010.00,affordable_now,full_payment,2025-08-04:5010,2025-08-04,,Pay 5010.00 today. The projected balance remains above the required minimum.
 request_75,28270.00,affordable_with_plan,installments,2026-04-09:9800.27;2026-05-09:9800.27;2026-06-08:9800.27,2026-06-08,,Use the recommended payment plan. All payments remain above the required minimum balance.
 request_76,1260.56,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
-request_77,60700.00,affordable_now,full_payment,2025-11-05:60700,2025-11-05,,Pay 60700.00 today. The projected balance remains above the required minimum.
+request_77,6630.57,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_78,50200.00,affordable_now,full_payment,2025-10-02:50200,2025-10-02,,Pay 50200.00 today. The projected balance remains above the required minimum.
 request_79,880.60,affordable_later,wait,2024-10-14:2151.6,2024-10-14,,Wait until 2024-10-14 to make the full payment. Paying earlier would risk the required minimum balance.
 request_80,127755.00,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
@@ -236,7 +236,7 @@ request_83,0,not_affordable,not_recommended,,,,None of the available payment opt
 request_84,42430.84,affordable_later,wait,2026-04-14:95400,2026-04-14,,Wait until 2026-04-14 to make the full payment. Paying earlier would risk the required minimum balance.
 request_85,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_86,46300.00,affordable_now,full_payment,2025-08-03:46300,2025-08-03,,Pay 46300.00 today. The projected balance remains above the required minimum.
-request_87,0,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
+request_87,28543.52,not_affordable,not_recommended,,,,None of the available payment options keeps the required minimum balance protected across the forecast.
 request_88,12235.89,affordable_with_plan,installments,2024-06-14:9045.23;2024-07-15:9045.23;2024-08-15:9045.23,2024-08-15,,Use the recommended payment plan. All payments remain above the required minimum balance.
 request_89,12028421.66,affordable_with_plan,installments,2025-11-18:4768746.67;2025-12-16:4768746.67;2026-01-13:4768746.67,2026-01-13,,Use the recommended payment plan. All payments remain above the required minimum balance.
 request_90,2560.00,affordable_now,full_payment,2026-07-06:2560,2026-07-06,,Pay 2560.00 today. The projected balance remains above the required minimum.

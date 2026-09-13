@@ -1,0 +1,12 @@
+{
+  "model": "gemini-3.5-flash-lite",
+  "requests_total": 250,
+  "gemini_calls": 109,
+  "gemini_cache_hits": 0,
+  "gemini_failures": 11,
+  "input_tokens": 40316,
+  "output_tokens": 35505,
+  "cached_tokens": 0,
+  "facts_extracted": 597,
+  "requests_without_unstructured_evidence": 130
+}

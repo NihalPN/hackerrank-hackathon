@@ -10,7 +10,6 @@ from typing import Any, Iterable
 
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types
 
 
 load_dotenv()
@@ -136,7 +135,10 @@ Evidence:
         images: Iterable[Path],
     ):
         content = [
-            self._prompt(prompt),
+            {
+                "type": "text",
+                "text": self._prompt(prompt),
+            }
         ]
 
         for image_path in images:
@@ -145,23 +147,23 @@ Evidence:
             if not image_path.exists():
                 continue
 
-            suffix = image_path.suffix.lower()
+            mime_type = "image/png"
 
-            mime_type = {
-                ".png": "image/png",
-                ".jpg": "image/jpeg",
-                ".jpeg": "image/jpeg",
-                ".webp": "image/webp",
-            }.get(suffix)
+            if image_path.suffix.lower() in {
+                ".jpg",
+                ".jpeg",
+            }:
+                mime_type = "image/jpeg"
 
-            if mime_type is None:
-                continue
-
+            # Interactions API supports multimodal input. The SDK's
+            # convenience APIs may differ by installed version, so keep
+            # image loading isolated here.
             content.append(
-                types.Part.from_bytes(
-                    data=image_path.read_bytes(),
-                    mime_type=mime_type,
-                )
+                {
+                    "type": "image",
+                    "mime_type": mime_type,
+                    "data": image_path.read_bytes(),
+                }
             )
 
         return content
@@ -181,45 +183,24 @@ Evidence:
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                # Free-tier protection: pace outbound requests.
-                now = time.monotonic()
-                elapsed = now - getattr(
-                    self,
-                    "_last_call_at",
-                    0.0,
-                )
-
-                min_interval = getattr(
-                    self,
-                    "min_interval_seconds",
-                    4.5,
-                )
-
-                if elapsed < min_interval:
-                    time.sleep(
-                        min_interval - elapsed
-                    )
-
-                self._last_call_at = time.monotonic()
-
-                response = self.client.models.generate_content(
+                interaction = self.client.interactions.create(
                     model=self.model,
-                    contents=content,
+                    input=content,
                 )
 
-                text = response.text or ""
+                text = interaction.output_text or ""
                 data = self._parse_json(text)
 
                 usage = getattr(
-                    response,
-                    "usage_metadata",
+                    interaction,
+                    "usage",
                     None,
                 )
 
                 input_tokens = int(
                     getattr(
                         usage,
-                        "prompt_token_count",
+                        "total_input_tokens",
                         0,
                     )
                     or 0
@@ -228,7 +209,7 @@ Evidence:
                 output_tokens = int(
                     getattr(
                         usage,
-                        "candidates_token_count",
+                        "total_output_tokens",
                         0,
                     )
                     or 0
@@ -237,12 +218,15 @@ Evidence:
                 total_tokens = int(
                     getattr(
                         usage,
-                        "total_token_count",
+                        "total_tokens",
                         0,
                     )
                     or 0
                 )
 
+                # Interactions currently exposes aggregate usage in the
+                # response. Cached-token accounting may not be present in
+                # every SDK response.
                 cached_tokens = max(
                     total_tokens
                     - input_tokens
@@ -266,47 +250,19 @@ Evidence:
 
             except Exception as exc:
                 last_error = exc
-                text = str(exc).lower()
 
-                retryable_terms = (
-                    "429",
-                    "rate limit",
-                    "rate_limit",
-                    "resource exhausted",
-                    "quota",
-                    "too many requests",
-                    "temporarily unavailable",
-                    "unavailable",
-                    "deadline exceeded",
-                    "timeout",
-                    "timed out",
-                    "503",
-                    "500",
-                )
-
-                retryable = any(
-                    term in text
-                    for term in retryable_terms
-                )
-
-                if (
-                    attempt >= self.max_retries
-                    or not retryable
-                ):
+                if attempt >= self.max_retries:
                     break
 
                 delay = min(
-                    30.0,
-                    (2 ** (attempt - 1)) * 2.0
-                    + random.uniform(0.5, 1.5),
+                    8.0,
+                    (2 ** (attempt - 1))
+                    + random.random(),
                 )
 
                 time.sleep(delay)
 
         raise RuntimeError(
-            "Gemini request failed after "
-            f"{self.max_retries} attempts: "
-            f"{type(last_error).__name__}: "
-            f"{last_error}"
+            f"Gemini Interactions request failed "
+            f"after {self.max_retries} attempts."
         ) from last_error
-

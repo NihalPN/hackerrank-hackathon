@@ -1,0 +1,1110 @@
+from __future__ import annotations
+
+import csv
+import json
+import re
+import sys
+from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+
+import gradio as gr
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "code"))
+
+from data.loader import load_dataset
+from data.models import FinancialRequest
+from finance.currency import ExchangeRateTable
+from finance.v4.decision_v4 import decide_v4
+
+
+DATASET_DIR = ROOT / "dataset"
+OUTPUT_PATH = DATASET_DIR / "output.csv"
+CACHE_PATH = ROOT / "runtime_cache" / "evidence.json"
+
+
+# =========================================================
+# Helpers
+# =========================================================
+
+def enum_or_str(value):
+    """Works for both Enum values and plain strings."""
+    return getattr(value, "value", value)
+
+
+def safe_str(value) -> str:
+    return "" if value is None else str(value)
+
+
+def load_output_rows() -> dict[str, dict]:
+    with OUTPUT_PATH.open(
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        return {
+            row["request_id"]: row
+            for row in csv.DictReader(f)
+        }
+
+
+def load_evidence_cache() -> dict:
+    if not CACHE_PATH.exists():
+        return {}
+
+    try:
+        return json.loads(
+            CACHE_PATH.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        return {}
+
+
+def parse_decimal(value) -> Decimal:
+    if value is None or safe_str(value).strip() == "":
+        raise ValueError("Amount is required.")
+
+    try:
+        amount = Decimal(str(value))
+    except (
+        InvalidOperation,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise ValueError(
+            "Amount must be a valid number."
+        ) from exc
+
+    if amount <= Decimal("0"):
+        raise ValueError(
+            "Amount must be greater than zero."
+        )
+
+    return amount
+
+
+def parse_date(value) -> date:
+    text = safe_str(value).strip()
+
+    if not text:
+        raise ValueError(
+            "Desired completion date is required."
+        )
+
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(
+            "Use the date format YYYY-MM-DD."
+        ) from exc
+
+
+def format_money(currency: str, amount) -> str:
+    try:
+        value = Decimal(str(amount))
+        return f"{currency} {value:,.2f}"
+    except (
+        InvalidOperation,
+        TypeError,
+        ValueError,
+    ):
+        return f"{currency} {safe_str(amount)}"
+
+
+def status_headline(status: str) -> str:
+    mapping = {
+        "affordable_now":
+            "## 🟢 BUY NOW",
+
+        "affordable_with_plan":
+            "## 🟡 BUY WITH PLAN",
+
+        "affordable_later":
+            "## 🟠 WAIT",
+
+        "not_affordable":
+            "## 🔴 NOT RECOMMENDED",
+    }
+
+    return mapping.get(
+        status,
+        f"## {status.replace('_', ' ').upper()}",
+    )
+
+
+def extract_text_amounts(text: str):
+    """
+    Extract explicit currency+amount references from the
+    user's request text. This is only used for validation/warnings.
+    It never overrides the numeric Amount field.
+    """
+    pattern = re.compile(
+        r"\b(IDR|INR|ZAR|USD|EUR|GBP|AUD|CAD)\s*"
+        r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+        re.IGNORECASE,
+    )
+
+    values = []
+
+    for currency, raw in pattern.findall(
+        text or ""
+    ):
+        try:
+            values.append(
+                (
+                    currency.upper(),
+                    Decimal(
+                        raw.replace(",", "")
+                    ),
+                )
+            )
+        except InvalidOperation:
+            pass
+
+    return values
+
+
+# =========================================================
+# Dataset
+# =========================================================
+
+dataset = load_dataset(DATASET_DIR)
+
+rates = ExchangeRateTable(
+    dataset.exchange_rates
+)
+
+output_rows = load_output_rows()
+evidence_cache = load_evidence_cache()
+
+request_ids = sorted(
+    dataset.requests.keys()
+)
+
+profile_ids = sorted(
+    dataset.profiles.keys()
+)
+
+
+# =========================================================
+# Financial profile helpers
+# =========================================================
+
+def profile_events(user_id: str):
+    return {
+        event_id: event
+        for event_id, event
+        in dataset.events.items()
+        if event.user_id == user_id
+    }
+
+
+def profile_window(
+    user_id: str,
+) -> tuple[date, date]:
+
+    events = list(
+        profile_events(user_id).values()
+    )
+
+    if not events:
+        raise ValueError(
+            "Selected profile has no financial history."
+        )
+
+    dates = [
+        event.event_date
+        for event in events
+    ]
+
+    dates.extend(
+        event.settlement_date
+        for event in events
+        if event.settlement_date is not None
+    )
+
+    simulation_start = (
+        max(dates) + timedelta(days=1)
+    )
+
+    simulation_end = (
+        simulation_start
+        + timedelta(days=90)
+    )
+
+    return (
+        simulation_start,
+        simulation_end,
+    )
+
+
+# =========================================================
+# Existing benchmark request
+# =========================================================
+
+def existing_request_result(
+    request_id: str,
+):
+
+    if not request_id:
+        return (
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "Select a request.",
+        )
+
+    request = dataset.requests.get(
+        request_id
+    )
+
+    row = output_rows.get(
+        request_id
+    )
+
+    if request is None or row is None:
+        return (
+            request_id,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "Request not found.",
+        )
+
+    cached = evidence_cache.get(
+        request_id,
+        {},
+    )
+
+    facts = cached.get(
+        "facts",
+        [],
+    ) or []
+
+    if facts:
+        evidence = "\n".join(
+            f"- {fact.get('fact_type', 'fact')}: "
+            f"{fact.get('value', '')}"
+            for fact in facts[:8]
+        )
+    elif cached.get("error"):
+        evidence = (
+            "⚠️ Gemini evidence was unavailable "
+            "for this request. "
+            "The deterministic fallback was used."
+        )
+    else:
+        evidence = (
+            "No unstructured evidence was required."
+        )
+
+    status = safe_str(
+        row["affordability_status"]
+    )
+
+    decision = (
+        f"{status_headline(status)}\n\n"
+
+        f"**Safe amount:** "
+        f"{row['amount_safe_to_pay']}\n\n"
+
+        f"**Recommended method:** "
+        f"{row['recommended_payment_method']}\n\n"
+
+        f"**Payment plan:** "
+        f"{row['payment_plan'] or 'None'}\n\n"
+
+        f"**Earliest full payment:** "
+        f"{row['earliest_date_for_full_payment'] or 'N/A'}\n\n"
+
+        f"**Spending changes:** "
+        f"{row['spending_changes_needed'] or 'None'}\n\n"
+
+        f"**Explanation:** "
+        f"{row['decision_explanation']}"
+    )
+
+    return (
+        request_id,
+        request.request_text,
+        row["amount_safe_to_pay"],
+        status,
+        row["recommended_payment_method"],
+        row["payment_plan"],
+        evidence,
+        decision,
+    )
+
+
+# =========================================================
+# Custom request UI helpers
+# =========================================================
+
+def profile_window_text(
+    user_id: str,
+):
+    try:
+        start_date, end_date = profile_window(
+            user_id
+        )
+
+        currency = dataset.profiles[
+            user_id
+        ].home_currency
+
+        return (
+            f"**Simulation start:** "
+            f"`{start_date.isoformat()}`\n\n"
+
+            f"**90-day end:** "
+            f"`{end_date.isoformat()}`\n\n"
+
+            f"**Home currency:** "
+            f"`{currency}`"
+        )
+
+    except Exception as exc:
+        return (
+            f"⚠️ **Profile error:** {exc}"
+        )
+
+
+def profile_window_values(
+    user_id: str,
+):
+    try:
+        start_date, end_date = profile_window(
+            user_id
+        )
+
+        currency = dataset.profiles[
+            user_id
+        ].home_currency
+
+        return (
+            start_date.isoformat(),
+            end_date.isoformat(),
+            currency,
+            start_date.isoformat(),
+        )
+
+    except Exception:
+        return (
+            "",
+            "",
+            "",
+            "",
+        )
+
+
+# =========================================================
+# Custom request decision
+# =========================================================
+
+def custom_request_result(
+    user_id,
+    amount,
+    desired_date,
+    request_text,
+    request_type,
+    allows_partial,
+):
+
+    try:
+        # -------------------------------------------------
+        # Guardrail 1: valid profile
+        # -------------------------------------------------
+
+        if user_id not in dataset.profiles:
+            raise ValueError(
+                "Select a valid demo financial profile."
+            )
+
+        profile = dataset.profiles[
+            user_id
+        ]
+
+        # -------------------------------------------------
+        # Guardrail 2: Decimal amount
+        # -------------------------------------------------
+
+        requested_amount = parse_decimal(
+            amount
+        )
+
+        # -------------------------------------------------
+        # Guardrail 3: 90-day window
+        # -------------------------------------------------
+
+        (
+            simulation_date,
+            horizon_end,
+        ) = profile_window(
+            user_id
+        )
+
+        completion_date = parse_date(
+            desired_date
+        )
+
+        if completion_date < simulation_date:
+            raise ValueError(
+                "Completion date cannot be before "
+                f"{simulation_date.isoformat()}."
+            )
+
+        if completion_date > horizon_end:
+            raise ValueError(
+                "Completion date must be between "
+                f"{simulation_date.isoformat()} "
+                f"and "
+                f"{horizon_end.isoformat()}."
+            )
+
+        # -------------------------------------------------
+        # Guardrail 4: currency/amount consistency warning
+        # -------------------------------------------------
+
+        text_amounts = extract_text_amounts(
+            request_text or ""
+        )
+
+        currency_warning = ""
+
+        if len(text_amounts) == 1:
+            text_currency, text_amount = (
+                text_amounts[0]
+            )
+
+            if text_currency != profile.home_currency:
+                raise ValueError(
+                    f"The request text specifies "
+                    f"{text_currency} {text_amount:,.2f}, "
+                    f"but the selected profile uses "
+                    f"{profile.home_currency}. "
+                    f"Please make the currency consistent."
+                )
+
+            if text_amount != requested_amount:
+                raise ValueError(
+                    f"The request text specifies "
+                    f"{format_money(text_currency, text_amount)}, "
+                    f"but the Amount field contains "
+                    f"{format_money(profile.home_currency, requested_amount)}. "
+                    f"Please make the two amounts match."
+                )
+
+        # -------------------------------------------------
+        # Build request
+        # -------------------------------------------------
+
+        request = FinancialRequest(
+            request_id=(
+                "custom_gradio_request"
+            ),
+
+            user_id=user_id,
+
+            request_date=simulation_date,
+
+            request_type=(
+                safe_str(
+                    request_type
+                ).strip()
+                or "custom_request"
+            ),
+
+            requested_amount=requested_amount,
+
+            desired_completion_date=(
+                completion_date
+            ),
+
+            allows_partial_payment=bool(
+                allows_partial
+            ),
+
+            request_text=(
+                safe_str(
+                    request_text
+                ).strip()
+                or "Custom financial request."
+            ),
+        )
+
+        # -------------------------------------------------
+        # Read-only user financial state
+        # -------------------------------------------------
+
+        events = profile_events(
+            user_id
+        )
+
+        # -------------------------------------------------
+        # No invented payment options
+        #
+        # The custom demo evaluates affordability from
+        # the user's financial state only.
+        # -------------------------------------------------
+
+        decision = decide_v4(
+            events=events,
+
+            profile=profile,
+
+            request=request,
+
+            payment_options=[],
+
+            exchange_rates=rates,
+        )
+
+        # -------------------------------------------------
+        # Normalize Enum OR string
+        #
+        # This fixes:
+        # "'str' object has no attribute 'value'"
+        # -------------------------------------------------
+
+        status = safe_str(
+            enum_or_str(
+                decision.affordability_status
+            )
+        )
+
+        method = safe_str(
+            enum_or_str(
+                decision.recommended_payment_method
+            )
+        )
+
+        # -------------------------------------------------
+        # Payment plan
+        # -------------------------------------------------
+
+        payment_plan = "; ".join(
+            f"{p.date.isoformat()}: {p.amount}"
+            for p in decision.payment_plan
+        )
+
+        if not payment_plan:
+            payment_plan = "None"
+
+        # -------------------------------------------------
+        # Earliest date
+        # -------------------------------------------------
+
+        earliest = (
+            decision
+            .earliest_date_for_full_payment
+            .isoformat()
+            if decision.earliest_date_for_full_payment
+            else "N/A"
+        )
+
+        # -------------------------------------------------
+        # Spending changes
+        # -------------------------------------------------
+
+        changes = "; ".join(
+            safe_str(change)
+            for change
+            in decision.spending_changes_needed
+            if safe_str(change)
+        )
+
+        if not changes:
+            changes = "None"
+
+        # -------------------------------------------------
+        # Decision presentation
+        # -------------------------------------------------
+
+        decision_text = (
+            f"{status_headline(status)}\n\n"
+
+            f"**Profile:** "
+            f"`{user_id}`\n\n"
+
+            f"**Simulation start:** "
+            f"`{simulation_date.isoformat()}`\n\n"
+
+            f"**Requested completion:** "
+            f"`{completion_date.isoformat()}`\n\n"
+
+            f"**90-day end:** "
+            f"`{horizon_end.isoformat()}`\n\n"
+
+            f"**Home currency:** "
+            f"`{profile.home_currency}`\n\n"
+
+            f"**Amount evaluated:** "
+            f"{format_money(profile.home_currency, requested_amount)}\n\n"
+
+            f"**Safe amount:** "
+            f"{format_money(profile.home_currency, decision.amount_safe_to_pay)}\n\n"
+
+            f"**Status:** "
+            f"{status}\n\n"
+
+            f"**Recommended method:** "
+            f"{method}\n\n"
+
+            f"**Payment plan:** "
+            f"{payment_plan}\n\n"
+
+            f"**Earliest full payment:** "
+            f"{earliest}\n\n"
+
+            f"**Spending changes:** "
+            f"{changes}\n\n"
+
+            f"**Explanation:** "
+            f"{(
+                decision.decision_explanation
+                .replace(
+                    "None of the available payment options keeps "
+                    "the required minimum balance protected across "
+                    "the forecast.",
+                    "The requested amount cannot be paid while "
+                    "keeping the required minimum balance protected "
+                    "across the forecast."
+                )
+            )}"
+        )
+
+        # -------------------------------------------------
+        # Visible guardrail report
+        # -------------------------------------------------
+
+        guardrails = (
+            "### Guardrails\n\n"
+
+            f"- Simulation start: "
+            f"`{simulation_date.isoformat()}`\n"
+
+            f"- Allowed completion window: "
+            f"`{simulation_date.isoformat()}` → "
+            f"`{horizon_end.isoformat()}`\n"
+
+            f"- Home currency: "
+            f"`{profile.home_currency}`\n"
+
+            "- Financial history is read-only.\n"
+
+            "- The Amount field is authoritative.\n"
+
+            "- Amount is converted to Decimal before "
+            "financial calculations.\n"
+
+            "- Gemini is not called from the custom "
+            "demo path while the current project quota "
+            "is exhausted.\n"
+
+            "- V4 remains the financial decision authority."
+        )
+
+        if currency_warning:
+            guardrails += (
+                "\n\n⚠️ **Input consistency warning:** "
+                + currency_warning
+            )
+
+        return (
+            status,
+
+            format_money(
+                profile.home_currency,
+                decision.amount_safe_to_pay,
+            ),
+
+            method,
+
+            payment_plan,
+
+            earliest,
+
+            changes,
+
+            decision_text,
+
+            guardrails,
+        )
+
+    except Exception as exc:
+
+        return (
+            "INPUT_ERROR",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+
+            "### Validation error\n\n"
+            f"**{type(exc).__name__}:** "
+            f"{exc}",
+        )
+
+
+# =========================================================
+# Default profile
+# =========================================================
+
+default_profile = (
+    profile_ids[0]
+    if profile_ids
+    else None
+)
+
+if default_profile:
+    (
+        default_start,
+        default_end,
+    ) = profile_window(
+        default_profile
+    )
+
+    default_currency = dataset.profiles[
+        default_profile
+    ].home_currency
+
+else:
+    default_start = None
+    default_end = None
+    default_currency = ""
+
+
+# =========================================================
+# Gradio UI
+# =========================================================
+
+with gr.Blocks(
+    title="Buy or Wait?"
+) as demo:
+
+    gr.Markdown(
+        """
+# 💰 Buy or Wait?
+
+### AI-powered affordability decision agent
+
+Gemini interprets unstructured financial evidence.
+The deterministic financial engine remains the authority
+for affordability, safe amount, and payment timing.
+"""
+    )
+
+    with gr.Tabs():
+
+        # =================================================
+        # Existing benchmark request
+        # =================================================
+
+        with gr.Tab(
+            "Existing request"
+        ):
+
+            existing_dropdown = gr.Dropdown(
+                choices=request_ids,
+
+                value=(
+                    request_ids[0]
+                    if request_ids
+                    else None
+                ),
+
+                label="Benchmark request",
+            )
+
+            existing_request_text = gr.Textbox(
+                label="User request",
+                lines=3,
+                interactive=False,
+            )
+
+            with gr.Row():
+
+                existing_safe = gr.Textbox(
+                    label="Safe amount",
+                    interactive=False,
+                )
+
+                existing_status = gr.Textbox(
+                    label="Affordability",
+                    interactive=False,
+                )
+
+                existing_method = gr.Textbox(
+                    label="Recommended method",
+                    interactive=False,
+                )
+
+            existing_plan = gr.Textbox(
+                label="Payment plan",
+                interactive=False,
+            )
+
+            with gr.Row():
+
+                existing_evidence = gr.Markdown()
+
+                existing_decision = gr.Markdown()
+
+            existing_dropdown.change(
+                fn=existing_request_result,
+
+                inputs=[
+                    existing_dropdown
+                ],
+
+                outputs=[
+                    existing_dropdown,
+                    existing_request_text,
+                    existing_safe,
+                    existing_status,
+                    existing_method,
+                    existing_plan,
+                    existing_evidence,
+                    existing_decision,
+                ],
+            )
+
+            demo.load(
+                fn=existing_request_result,
+
+                inputs=[
+                    existing_dropdown
+                ],
+
+                outputs=[
+                    existing_dropdown,
+                    existing_request_text,
+                    existing_safe,
+                    existing_status,
+                    existing_method,
+                    existing_plan,
+                    existing_evidence,
+                    existing_decision,
+                ],
+            )
+
+        # =================================================
+        # Custom request
+        # =================================================
+
+        with gr.Tab(
+            "Ask your own request"
+        ):
+
+            gr.Markdown(
+                """
+### Create a new affordability request
+
+The request is evaluated against a **read-only demo
+financial profile** from the dataset.
+
+You can change the request, but you cannot change
+the underlying financial history.
+"""
+            )
+
+            custom_profile = gr.Dropdown(
+                choices=profile_ids,
+
+                value=default_profile,
+
+                label="Demo financial profile",
+            )
+
+            with gr.Row():
+
+                custom_start_date = gr.Textbox(
+                    label="Simulation start date",
+
+                    value=(
+                        default_start.isoformat()
+                        if default_start
+                        else ""
+                    ),
+
+                    interactive=False,
+                )
+
+                custom_end_date = gr.Textbox(
+                    label="90-day end date",
+
+                    value=(
+                        default_end.isoformat()
+                        if default_end
+                        else ""
+                    ),
+
+                    interactive=False,
+                )
+
+                custom_currency = gr.Textbox(
+                    label="Home currency",
+
+                    value=default_currency,
+
+                    interactive=False,
+                )
+
+            gr.Markdown(
+                "The requested completion date must fall "
+                "inside this 90-day safety window."
+            )
+
+            with gr.Row():
+
+                custom_amount = gr.Number(
+                    label="Amount",
+
+                    minimum=0.01,
+
+                    precision=2,
+                )
+
+                custom_date = gr.Textbox(
+                    label="Desired completion date",
+
+                    value=(
+                        default_start.isoformat()
+                        if default_start
+                        else ""
+                    ),
+
+                    placeholder="YYYY-MM-DD",
+                )
+
+            custom_type = gr.Textbox(
+                value="custom_request",
+
+                label="Request type",
+            )
+
+            custom_request = gr.Textbox(
+                label="What do you want to pay?",
+
+                placeholder=(
+                    "Example: I want to make an "
+                    "extra loan payment of INR 53,500."
+                ),
+
+                lines=4,
+            )
+
+            custom_partial = gr.Checkbox(
+                label="Allow partial payment",
+
+                value=False,
+            )
+
+            analyze_button = gr.Button(
+                "Analyze request",
+
+                variant="primary",
+            )
+
+            with gr.Row():
+
+                custom_status = gr.Textbox(
+                    label="Affordability",
+
+                    interactive=False,
+                )
+
+                custom_safe = gr.Textbox(
+                    label="Safe amount",
+
+                    interactive=False,
+                )
+
+                custom_method = gr.Textbox(
+                    label="Recommended method",
+
+                    interactive=False,
+                )
+
+            custom_plan = gr.Textbox(
+                label="Payment plan",
+
+                interactive=False,
+            )
+
+            custom_earliest = gr.Textbox(
+                label="Earliest full payment",
+
+                interactive=False,
+            )
+
+            custom_changes = gr.Textbox(
+                label="Spending changes",
+
+                interactive=False,
+            )
+
+            with gr.Row():
+
+                custom_decision = gr.Markdown()
+
+                custom_guardrails = gr.Markdown()
+
+            custom_profile.change(
+                fn=profile_window_values,
+
+                inputs=[
+                    custom_profile
+                ],
+
+                outputs=[
+                    custom_start_date,
+                    custom_end_date,
+                    custom_currency,
+                    custom_date,
+                ],
+            )
+
+            analyze_button.click(
+                fn=custom_request_result,
+
+                inputs=[
+                    custom_profile,
+                    custom_amount,
+                    custom_date,
+                    custom_request,
+                    custom_type,
+                    custom_partial,
+                ],
+
+                outputs=[
+                    custom_status,
+                    custom_safe,
+                    custom_method,
+                    custom_plan,
+                    custom_earliest,
+                    custom_changes,
+                    custom_decision,
+                    custom_guardrails,
+                ],
+            )
+
+
+if __name__ == "__main__":
+
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        share=False,
+    )

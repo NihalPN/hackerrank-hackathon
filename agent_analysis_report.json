@@ -1,0 +1,21 @@
+{
+  "agent_architecture": {
+    "model_role": "evidence extraction and contextual interpretation",
+    "financial_authority": "deterministic V4 financial engine",
+    "llm_can_modify_existing_events": false,
+    "llm_can_override_affordability": false,
+    "evidence_reconciled_into_temporary_events": true
+  },
+  "evidence_processing": {
+    "requests_cached": 120,
+    "requests_with_evidence": 0,
+    "facts_extracted": 0,
+    "facts_linked_to_events": 0,
+    "gemini_failures": 120,
+    "fact_types": {}
+  },
+  "output": {
+    "path": "dataset/output.csv",
+    "financial_decision_source": "V4 deterministic engine"
+  }
+}

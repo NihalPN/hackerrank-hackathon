@@ -165,12 +165,7 @@ def main():
 
             cached = cache.get(request_id)
 
-            # Only successful Gemini results are reusable cache entries.
-            # Failed entries are retried on the next run.
-            if (
-                cached is not None
-                and not cached.get("error")
-            ):
+            if cached is not None:
 
                 usage["gemini_cache_hits"] += 1
 
