@@ -1,0 +1,506 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, timedelta
+from decimal import Decimal
+from statistics import median
+
+from data.models import FinancialEvent, FinancialProfile
+from finance.currency import ExchangeRateTable
+
+
+ZERO = Decimal("0")
+
+
+@dataclass(frozen=True)
+class ForecastFlow:
+    flow_date: date
+    amount: Decimal
+    event_id: str | None
+    category: str
+    description: str
+    essential: bool
+    flexible: bool
+
+
+@dataclass(frozen=True)
+class Forecast:
+    start_date: date
+    end_date: date
+    starting_balance: Decimal
+    flows: tuple[ForecastFlow, ...]
+
+    def balance_on(self, target_date: date) -> Decimal:
+        balance = self.starting_balance
+
+        for flow in self.flows:
+            if flow.flow_date <= target_date:
+                balance += flow.amount
+
+        return balance
+
+    def minimum_balance(self) -> Decimal:
+        balance = self.starting_balance
+        minimum = balance
+
+        for flow in self.flows:
+            balance += flow.amount
+            minimum = min(minimum, balance)
+
+        return minimum
+
+    def is_safe(self, minimum_required: Decimal) -> bool:
+        return self.minimum_balance() >= minimum_required
+
+
+def _valid_cash_event(event: FinancialEvent) -> bool:
+    if event.direction.value == "non_cash":
+        return False
+
+    if event.status.value in {
+        "failed",
+        "cancelled",
+        "unrealized",
+    }:
+        return False
+
+    return event.amount is not None
+
+
+def _event_date(event: FinancialEvent) -> date | None:
+    if event.settlement_date is not None:
+        return event.settlement_date
+
+    if event.status.value in {"pending", "scheduled"}:
+        return event.event_date
+
+    return None
+
+
+def _converted_amount(
+    event: FinancialEvent,
+    event_date: date,
+    home_currency: str,
+    rates: ExchangeRateTable,
+) -> Decimal:
+
+    if event.currency == home_currency:
+        return event.amount
+
+    return rates.convert(
+        event.amount,
+        event_date,
+        event.currency,
+        home_currency,
+    )
+
+
+def _signed_amount(
+    event: FinancialEvent,
+    event_date: date,
+    home_currency: str,
+    rates: ExchangeRateTable,
+) -> Decimal:
+
+    amount = _converted_amount(
+        event,
+        event_date,
+        home_currency,
+        rates,
+    )
+
+    if event.direction.value == "debit":
+        return -amount
+
+    if event.direction.value == "credit":
+        # Pending credits must not count.
+        if event.status.value == "pending":
+            return ZERO
+
+        return amount
+
+    return ZERO
+
+
+def _historical_events(
+    events: dict[str, FinancialEvent],
+    user_id: str,
+    before: date,
+) -> list[FinancialEvent]:
+
+    result = []
+
+    for event in events.values():
+        if event.user_id != user_id:
+            continue
+
+        if event.event_date >= before:
+            continue
+
+        if not _valid_cash_event(event):
+            continue
+
+        if event.amount is None:
+            continue
+
+        result.append(event)
+
+    return sorted(
+        result,
+        key=lambda e: (
+            e.event_date,
+            e.event_id,
+        ),
+    )
+
+
+def _day_difference(a: date, b: date) -> int:
+    return abs((a - b).days)
+
+
+def _recurrence_interval(
+    events: list[FinancialEvent],
+) -> int | None:
+
+    dates = sorted(
+        {
+            e.event_date
+            for e in events
+        }
+    )
+
+    if len(dates) < 3:
+        return None
+
+    intervals = [
+        (dates[i] - dates[i - 1]).days
+        for i in range(1, len(dates))
+    ]
+
+    if not intervals:
+        return None
+
+    typical = median(intervals)
+
+    if 25 <= typical <= 35:
+        return 30
+
+    if 12 <= typical <= 16:
+        return 14
+
+    if 6 <= typical <= 8:
+        return 7
+
+    return None
+
+
+def _is_recurring(
+    events: list[FinancialEvent],
+) -> bool:
+
+    return _recurrence_interval(events) is not None
+
+
+def _recurring_amount(
+    events: list[FinancialEvent],
+) -> Decimal:
+
+    values = [
+        e.amount
+        for e in events[-6:]
+        if e.amount is not None
+    ]
+
+    if not values:
+        return ZERO
+
+    return Decimal(str(median(values)))
+
+
+def _forecast_recurring_group(
+    history: list[FinancialEvent],
+    start_date: date,
+    end_date: date,
+    home_currency: str,
+    rates: ExchangeRateTable,
+    explicit_dates: set[date] | None = None,
+) -> list[ForecastFlow]:
+
+    explicit_dates = explicit_dates or set()
+
+    if not _is_recurring(history):
+        return []
+
+    interval = _recurrence_interval(history)
+
+    if interval is None:
+        return []
+
+    amount = _recurring_amount(history)
+
+    if amount <= ZERO:
+        return []
+
+    last = max(
+        e.event_date
+        for e in history
+    )
+
+    latest = history[-1]
+
+    result = []
+
+    current = last + timedelta(days=interval)
+
+    while current <= end_date:
+
+        overlapping_explicit = any(
+            abs((current - explicit).days) <= 1
+            for explicit in explicit_dates
+        )
+
+        if current >= start_date and not overlapping_explicit:
+
+            try:
+                converted = _converted_amount(
+                    latest,
+                    current,
+                    home_currency,
+                    rates,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                if not message.startswith("Missing exchange rate:"):
+                    raise
+
+                # The event already tells us the currency pair.
+                # Use the latest supplied rate on or before the
+                # forecast date rather than parsing the error string.
+                rate_value = rates.latest_on_or_before(
+                    current,
+                    latest.currency,
+                    home_currency,
+                )
+
+                converted = latest.amount * rate_value
+
+            signed = (
+                -converted
+                if latest.direction.value == "debit"
+                else converted
+            )
+
+            result.append(
+                ForecastFlow(
+                    flow_date=current,
+                    amount=signed,
+                    event_id=None,
+                    category=latest.category,
+                    description=latest.description,
+                    essential=latest.category in (),
+                    flexible=False,
+                )
+            )
+
+        current += timedelta(days=interval)
+
+    return result
+
+
+def build_forecast(
+    events: dict[str, FinancialEvent],
+    profile: FinancialProfile,
+    rates: ExchangeRateTable,
+    start_date: date,
+    days: int = 90,
+) -> Forecast:
+
+    end_date = start_date + timedelta(days=days)
+
+    flows: list[ForecastFlow] = []
+
+    # ------------------------------------------------------------
+    # Explicit future cash events
+    # ------------------------------------------------------------
+
+    for event in events.values():
+
+        if event.user_id != profile.user_id:
+            continue
+
+        if not _valid_cash_event(event):
+            continue
+
+        event_date = _event_date(event)
+
+        if event_date is None:
+            continue
+
+        if event_date < start_date:
+            continue
+
+        if event_date > end_date:
+            continue
+
+        amount = _signed_amount(
+            event,
+            event_date,
+            profile.home_currency,
+            rates,
+        )
+
+        # Pending credits have already been converted to zero.
+        flows.append(
+            ForecastFlow(
+                flow_date=event_date,
+                amount=amount,
+                event_id=event.event_id,
+                category=event.category,
+                description=event.description,
+                essential=event.category in profile.protected_categories,
+                flexible=(
+                    event.category in profile.reducible_categories
+                    or event.category in profile.stoppable_categories
+                )
+                and event.flexibility in {
+                    "reducible",
+                    "stoppable",
+                    "reducible_or_stoppable",
+                },
+            )
+        )
+
+    # ------------------------------------------------------------
+    # Detect recurring groups
+    # ------------------------------------------------------------
+
+    groups: dict[tuple[str, str, str, str], list[FinancialEvent]] = {}
+
+    for event in _historical_events(
+        events,
+        profile.user_id,
+        start_date,
+    ):
+
+        key = (
+            event.event_type,
+            event.category,
+            event.description,
+            event.direction.value,
+        )
+
+        groups.setdefault(key, []).append(event)
+
+    explicit_dates_by_key = {}
+
+    for e in events.values():
+        event_date = _event_date(e)
+
+        if not (
+            e.user_id == profile.user_id
+            and event_date is not None
+            and start_date <= event_date <= end_date
+            and _valid_cash_event(e)
+        ):
+            continue
+
+        key = (
+            e.event_type,
+            e.category,
+            e.description,
+            e.direction.value,
+        )
+
+        explicit_dates_by_key.setdefault(key, set()).add(event_date)
+
+    for key, history in groups.items():
+
+        if len(history) < 3:
+            continue
+
+        explicit_dates = explicit_dates_by_key.get(key, set())
+
+        recurring = _forecast_recurring_group(
+            history,
+            start_date,
+            end_date,
+            profile.home_currency,
+            rates,
+            explicit_dates,
+        )
+
+        for flow in recurring:
+
+            essential = (
+                flow.category
+                in profile.protected_categories
+            )
+
+            flexible = (
+                flow.category
+                in profile.reducible_categories
+                or flow.category
+                in profile.stoppable_categories
+            )
+
+            flows.append(
+                ForecastFlow(
+                    flow_date=flow.flow_date,
+                    amount=flow.amount,
+                    event_id=flow.event_id,
+                    category=flow.category,
+                    description=flow.description,
+                    essential=essential,
+                    flexible=flexible,
+                )
+            )
+
+    flows.sort(
+        key=lambda f: (
+            f.flow_date,
+            f.event_id or "",
+        )
+    )
+
+    return Forecast(
+        start_date=start_date,
+        end_date=end_date,
+        starting_balance=profile.current_available_balance,
+        flows=tuple(flows),
+    )
+
+
+def simulate_payment(
+    forecast: Forecast,
+    payments: list[tuple[date, Decimal]],
+) -> Forecast:
+
+    additional = [
+        ForecastFlow(
+            flow_date=payment_date,
+            amount=-amount,
+            event_id=None,
+            category="request",
+            description="requested payment",
+            essential=True,
+            flexible=False,
+        )
+        for payment_date, amount in payments
+    ]
+
+    flows = list(forecast.flows)
+    flows.extend(additional)
+
+    flows.sort(
+        key=lambda f: (
+            f.flow_date,
+            f.event_id or "",
+        )
+    )
+
+    return Forecast(
+        start_date=forecast.start_date,
+        end_date=forecast.end_date,
+        starting_balance=forecast.starting_balance,
+        flows=tuple(flows),
+    )

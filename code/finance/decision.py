@@ -1,0 +1,863 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import date, timedelta
+from decimal import Decimal
+
+from data.models import (
+    FinancialDecision,
+    FinancialEvent,
+    FinancialProfile,
+    FinancialRequest,
+    PaymentMethod,
+    PaymentOption,
+    PaymentPlanEntry,
+)
+from finance.currency import ExchangeRateTable
+from finance.forecast import (
+    Forecast,
+    ForecastFlow,
+    build_forecast,
+    simulate_payment,
+)
+
+
+ZERO = Decimal("0")
+
+
+def _plan_entries(
+    option: PaymentOption,
+) -> tuple[PaymentPlanEntry, ...]:
+
+    entries = []
+
+    for index in range(option.number_of_payments):
+
+        if option.payment_frequency_days is None:
+            payment_date = option.first_payment_date
+        else:
+            payment_date = (
+                option.first_payment_date
+                + timedelta(
+                    days=option.payment_frequency_days * index
+                )
+            )
+
+        entries.append(
+            PaymentPlanEntry(
+                payment_date=payment_date,
+                amount=option.payment_amount,
+            )
+        )
+
+    return tuple(entries)
+
+
+def _payments_from_entries(
+    entries: tuple[PaymentPlanEntry, ...],
+) -> list[tuple[date, Decimal]]:
+
+    return [
+        (entry.payment_date, entry.amount)
+        for entry in entries
+    ]
+
+
+def _safe_amount_from_forecast(
+    forecast: Forecast,
+    minimum_balance: Decimal,
+    request_amount: Decimal,
+) -> Decimal:
+
+    # How far the worst projected balance is above the required floor.
+    cushion = forecast.minimum_balance() - minimum_balance
+
+    if cushion <= ZERO:
+        return ZERO
+
+    return min(
+        cushion,
+        request_amount,
+    )
+
+
+def _forecast_with_payment(
+    forecast: Forecast,
+    payment_date: date,
+    amount: Decimal,
+) -> Forecast:
+
+    return simulate_payment(
+        forecast,
+        [(payment_date, amount)],
+    )
+
+
+def _is_safe_payment(
+    forecast: Forecast,
+    minimum_balance: Decimal,
+    payments: list[tuple[date, Decimal]],
+) -> bool:
+
+    simulated = simulate_payment(
+        forecast,
+        payments,
+    )
+
+    return simulated.is_safe(minimum_balance)
+
+
+def _earliest_safe_payment_date(
+    forecast: Forecast,
+    start_date: date,
+    end_date: date,
+    amount: Decimal,
+    minimum_balance: Decimal,
+) -> date | None:
+    """Return the first date on which a payment of `amount`
+    can be made while preserving the forecast minimum."""
+    if amount <= ZERO:
+        return start_date
+
+    current = start_date
+
+    while current <= end_date:
+        if _is_safe_payment(
+            forecast,
+            minimum_balance,
+            [(current, amount)],
+        ):
+            return current
+
+        current += timedelta(days=1)
+
+    return None
+
+
+def _earliest_full_payment_date(
+    forecast: Forecast,
+    request: FinancialRequest,
+    minimum_balance: Decimal,
+) -> date | None:
+
+    start = request.request_date
+    end = min(
+        forecast.end_date,
+        request.desired_completion_date,
+    )
+
+    return _earliest_safe_payment_date(
+        forecast=forecast,
+        start_date=start,
+        end_date=end,
+        amount=request.requested_amount,
+        minimum_balance=minimum_balance,
+    )
+
+
+def _eligible_installments(
+    profile: FinancialProfile,
+    options: list[PaymentOption],
+    deadline: date,
+) -> list[PaymentOption]:
+
+    if "installments" not in profile.payment_methods_user_will_consider:
+        return []
+
+    result = []
+
+    for option in options:
+
+        if option.payment_method != "installments":
+            continue
+
+        entries = _plan_entries(option)
+
+        if not entries:
+            continue
+
+        if entries[-1].payment_date > deadline:
+            continue
+
+        if (
+            profile.max_installment_months is not None
+            and option.payment_frequency_days is not None
+        ):
+
+            total_days = (
+                option.payment_frequency_days
+                * max(option.number_of_payments - 1, 0)
+            )
+
+            # Approximate duration in months.
+            months = (total_days + 29) // 30
+
+            if months > profile.max_installment_months:
+                continue
+
+        result.append(option)
+
+    return sorted(
+        result,
+        key=lambda option: (
+            option.total_payable_amount,
+            option.first_payment_date,
+            option.number_of_payments,
+            option.payment_option_id,
+        ),
+    )
+
+
+def _eligible_full_payment(
+    profile: FinancialProfile,
+    options: list[PaymentOption],
+) -> list[PaymentOption]:
+
+    if "full_payment" not in profile.payment_methods_user_will_consider:
+        return []
+
+    return sorted(
+        [
+            option
+            for option in options
+            if option.payment_method == "full_payment"
+            and option.number_of_payments == 1
+        ],
+        key=lambda option: (
+            option.total_payable_amount,
+            option.payment_amount,
+            option.payment_option_id,
+        ),
+    )
+
+
+def _change_event(
+    flow: ForecastFlow,
+    new_amount: Decimal,
+) -> ForecastFlow:
+
+    old_amount = flow.amount
+
+    if old_amount < ZERO:
+        new_signed = -new_amount
+    else:
+        new_signed = new_amount
+
+    return replace(
+        flow,
+        amount=new_signed,
+    )
+
+
+def _apply_spending_changes(
+    forecast: Forecast,
+    profile: FinancialProfile,
+    events: dict[str, FinancialEvent],
+    required_reduction: Decimal,
+) -> tuple[Forecast, tuple[str, ...]] | None:
+
+    if required_reduction <= ZERO:
+        return forecast, ()
+
+    candidates = []
+
+    for flow in forecast.flows:
+
+        if flow.event_id is None:
+            continue
+
+        if flow.amount >= ZERO:
+            continue
+
+        event = events.get(flow.event_id)
+
+        if event is None:
+            continue
+
+        if event.flexibility not in {
+            "reducible",
+            "stoppable",
+            "reducible_or_stoppable",
+        }:
+            continue
+
+        can_stop = (
+            event.category in profile.stoppable_categories
+            and event.flexibility in {
+                "stoppable",
+                "reducible_or_stoppable",
+            }
+        )
+
+        can_reduce = (
+            event.category in profile.reducible_categories
+            and event.flexibility in {
+                "reducible",
+                "reducible_or_stoppable",
+            }
+        )
+
+        if not can_stop and not can_reduce:
+            continue
+
+        current_amount = abs(flow.amount)
+
+        minimum_allowed = event.minimum_allowed_amount
+
+        if minimum_allowed is None:
+            minimum_allowed = ZERO
+
+        if minimum_allowed < ZERO:
+            minimum_allowed = ZERO
+
+        maximum_reduction = max(
+            ZERO,
+            current_amount - minimum_allowed,
+        )
+
+        if can_stop:
+            maximum_reduction = current_amount
+
+        if maximum_reduction <= ZERO:
+            continue
+
+        candidates.append(
+            (
+                maximum_reduction,
+                current_amount,
+                flow,
+                event,
+                can_stop,
+                can_reduce,
+            )
+        )
+
+    # Prefer larger possible reductions first.
+    candidates.sort(
+        key=lambda item: (
+            -item[0],
+            item[2].flow_date,
+            item[2].event_id or "",
+        )
+    )
+
+    remaining = required_reduction
+    changes = []
+    new_flows = list(forecast.flows)
+
+    for (
+        maximum_reduction,
+        current_amount,
+        flow,
+        event,
+        can_stop,
+        can_reduce,
+    ) in candidates:
+
+        if remaining <= ZERO:
+            break
+
+        reduction = min(
+            remaining,
+            maximum_reduction,
+        )
+
+        # Full stop is allowed only for explicitly stoppable
+        # expenses.
+        if (
+            can_stop
+            and reduction >= current_amount
+        ):
+            replacement = replace(
+                flow,
+                amount=ZERO,
+            )
+
+            action = f"stop:{flow.event_id}"
+
+            actual_reduction = current_amount
+
+        else:
+            if not can_reduce:
+                continue
+
+            new_amount = current_amount - reduction
+
+            minimum_allowed = event.minimum_allowed_amount
+
+            if minimum_allowed is not None:
+                new_amount = max(
+                    new_amount,
+                    minimum_allowed,
+                )
+
+            actual_reduction = current_amount - new_amount
+
+            if actual_reduction <= ZERO:
+                continue
+
+            replacement = replace(
+                flow,
+                amount=-new_amount,
+            )
+
+            action = (
+                f"reduce_to:{flow.event_id}:{new_amount}"
+            )
+
+        index = new_flows.index(flow)
+        new_flows[index] = replacement
+
+        changes.append(action)
+        remaining -= actual_reduction
+
+        if len(changes) >= 3:
+            break
+
+    if remaining > ZERO:
+        return None
+
+    new_forecast = Forecast(
+        start_date=forecast.start_date,
+        end_date=forecast.end_date,
+        starting_balance=forecast.starting_balance,
+        flows=tuple(
+            sorted(
+                new_flows,
+                key=lambda f: (
+                    f.flow_date,
+                    f.event_id or "",
+                ),
+            )
+        ),
+    )
+
+    return new_forecast, tuple(changes)
+
+def _make_decision(
+    request: FinancialRequest,
+    safe: Decimal,
+    status: str,
+    method: PaymentMethod,
+    entries: tuple[PaymentPlanEntry, ...],
+    earliest: date | None,
+    changes: tuple[str, ...],
+    explanation: str,
+) -> FinancialDecision:
+
+    return FinancialDecision(
+        request_id=request.request_id,
+        amount_safe_to_pay=safe,
+        affordability_status=status,
+        recommended_payment_method=method,
+        payment_plan=entries,
+        earliest_date_for_full_payment=earliest,
+        spending_changes_needed=changes,
+        decision_explanation=explanation,
+    )
+
+
+def decide(
+    events: dict[str, FinancialEvent],
+    profile: FinancialProfile,
+    request: FinancialRequest,
+    payment_options: list[PaymentOption],
+    exchange_rates=None,
+) -> FinancialDecision:
+
+    # ------------------------------------------------------------
+    # Exchange rates
+    # ------------------------------------------------------------
+
+    if exchange_rates is None:
+        raise ValueError(
+            "exchange_rates are required by the decision engine"
+        )
+
+    rates = (
+        exchange_rates
+        if isinstance(exchange_rates, ExchangeRateTable)
+        else ExchangeRateTable(exchange_rates)
+    )
+
+    # ------------------------------------------------------------
+    # Build 90-day forecast
+    # ------------------------------------------------------------
+
+    forecast = build_forecast(
+        events=events,
+        profile=profile,
+        rates=rates,
+        start_date=request.request_date,
+        days=90,
+    )
+
+    minimum = profile.minimum_balance_to_keep
+
+    # ------------------------------------------------------------
+    # amount_safe_to_pay
+    #
+    # BEFORE optional spending changes.
+    # ------------------------------------------------------------
+
+    safe = _safe_amount_from_forecast(
+        forecast,
+        minimum,
+        request.requested_amount,
+    )
+
+    # ------------------------------------------------------------
+    # Earliest date full payment is financially safe,
+    # independent of payment-method preferences.
+    # ------------------------------------------------------------
+
+    earliest = _earliest_full_payment_date(
+        forecast,
+        request,
+        minimum,
+    )
+
+    # ------------------------------------------------------------
+    # Candidate plans
+    # ------------------------------------------------------------
+
+    candidates = []
+
+    # ------------------------------------------------------------
+    # 1. Full payment
+    # ------------------------------------------------------------
+
+    for option in _eligible_full_payment(
+        profile,
+        payment_options,
+    ):
+
+        entries = _plan_entries(option)
+
+        if len(entries) != 1:
+            continue
+
+        payment_date = entries[0].payment_date
+
+        if payment_date < request.request_date:
+            continue
+
+        if payment_date > request.desired_completion_date:
+            continue
+
+        if _is_safe_payment(
+            forecast,
+            minimum,
+            _payments_from_entries(entries),
+        ):
+
+            candidates.append(
+                (
+                    True,
+                    (),
+                    option.total_payable_amount,
+                    payment_date,
+                    1,
+                    option.payment_option_id,
+                    PaymentMethod.FULL_PAYMENT,
+                    entries,
+                )
+            )
+
+    # ------------------------------------------------------------
+    # 2. Installments
+    # ------------------------------------------------------------
+
+    for option in _eligible_installments(
+        profile,
+        payment_options,
+        request.desired_completion_date,
+    ):
+
+        entries = _plan_entries(option)
+
+        if _is_safe_payment(
+            forecast,
+            minimum,
+            _payments_from_entries(entries),
+        ):
+
+            candidates.append(
+                (
+                    True,
+                    (),
+                    option.total_payable_amount,
+                    entries[0].payment_date,
+                    len(entries),
+                    option.payment_option_id,
+                    PaymentMethod.INSTALLMENTS,
+                    entries,
+                )
+            )
+
+    # ------------------------------------------------------------
+    # 3. Partial payment
+    # ------------------------------------------------------------
+
+    if (
+        request.allows_partial_payment
+        and "partial_payment"
+        in profile.payment_methods_user_will_consider
+        and earliest is not None
+        and earliest <= request.desired_completion_date
+        and safe > ZERO
+        and safe < request.requested_amount
+    ):
+
+        remaining = request.requested_amount - safe
+
+        # The second payment must be scheduled AFTER the first
+        # payment. The earliest date for the full request is not
+        # necessarily the earliest date for the remaining amount.
+        remaining_start = request.request_date + timedelta(days=1)
+
+        remaining_date = _earliest_safe_payment_date(
+            forecast=simulate_payment(
+                forecast,
+                [
+                    (
+                        request.request_date,
+                        safe,
+                    )
+                ],
+            ),
+            start_date=remaining_start,
+            end_date=min(
+                forecast.end_date,
+                request.desired_completion_date,
+            ),
+            amount=remaining,
+            minimum_balance=minimum,
+        )
+
+        if remaining_date is not None:
+
+            payments = [
+                (
+                    request.request_date,
+                    safe,
+                ),
+                (
+                    remaining_date,
+                    remaining,
+                ),
+            ]
+
+            if _is_safe_payment(
+                forecast,
+                minimum,
+                payments,
+            ):
+
+                entries = (
+                    PaymentPlanEntry(
+                        payment_date=request.request_date,
+                        amount=safe,
+                    ),
+                    PaymentPlanEntry(
+                        payment_date=remaining_date,
+                        amount=remaining,
+                    ),
+                )
+
+                candidates.append(
+                    (
+                        True,
+                        (),
+                        request.requested_amount,
+                        request.request_date,
+                        2,
+                        "partial",
+                        PaymentMethod.PARTIAL_PAYMENT,
+                        entries,
+                    )
+                )
+
+    # ------------------------------------------------------------
+    # Rank candidates
+    #
+    # 1. completes by deadline
+    # 2. no changes
+    # 3. lowest total paid
+    # 4. earliest start
+    # 5. fewer payments
+    # 6. lowest option id
+    # ------------------------------------------------------------
+
+    if candidates:
+
+        candidates.sort(
+            key=lambda c: (
+                not c[0],
+                len(c[1]),
+                c[2],
+                c[3],
+                c[4],
+                c[5],
+            )
+        )
+
+        best = candidates[0]
+
+        method = best[6]
+        entries = best[7]
+
+        if method == PaymentMethod.FULL_PAYMENT:
+            selected_date = entries[0].payment_date
+
+            if selected_date == request.request_date:
+                status = "affordable_now"
+                earliest_result = request.request_date
+            else:
+                status = "affordable_with_plan"
+                earliest_result = selected_date
+
+        else:
+            status = "affordable_with_plan"
+            earliest_result = earliest
+
+        return _make_decision(
+            request=request,
+            safe=safe,
+            status=status,
+            method=method,
+            entries=entries,
+            earliest=earliest_result,
+            changes=(),
+            explanation=(
+                "The selected payment plan completes the request "
+                "within the deadline while keeping the projected "
+                "balance at or above the required minimum."
+            ),
+        )
+
+    # ------------------------------------------------------------
+    # 4. Spending changes
+    # ------------------------------------------------------------
+
+    if earliest is not None and earliest <= request.desired_completion_date:
+
+        # Find how much the full payment violates the forecast.
+        simulated = _forecast_with_payment(
+            forecast,
+            request.request_date,
+            request.requested_amount,
+        )
+
+        deficit = max(
+            ZERO,
+            minimum - simulated.minimum_balance(),
+        )
+
+        changed = _apply_spending_changes(
+            forecast,
+            profile,
+            events,
+            deficit,
+        )
+
+        if changed is not None:
+
+            changed_forecast, changes = changed
+
+            if _is_safe_payment(
+                changed_forecast,
+                minimum,
+                [
+                    (
+                        request.request_date,
+                        request.requested_amount,
+                    )
+                ],
+            ):
+
+                entries = (
+                    PaymentPlanEntry(
+                        payment_date=request.request_date,
+                        amount=request.requested_amount,
+                    ),
+                )
+
+                return _make_decision(
+                    request=request,
+                    safe=safe,
+                    status="affordable_with_plan",
+                    method=PaymentMethod.FULL_PAYMENT,
+                    entries=entries,
+                    earliest=request.request_date,
+                    changes=changes,
+                    explanation=(
+                        "The request is affordable with the listed "
+                        "flexible spending changes while preserving "
+                        "the required minimum balance."
+                    ),
+                )
+
+    # ------------------------------------------------------------
+    # 5. Wait
+    # ------------------------------------------------------------
+
+    if (
+        earliest is not None
+        and earliest > request.request_date
+        and earliest <= request.desired_completion_date
+        and "full_payment"
+        in profile.payment_methods_user_will_consider
+    ):
+
+        entries = (
+            PaymentPlanEntry(
+                payment_date=earliest,
+                amount=request.requested_amount,
+            ),
+        )
+
+        if _is_safe_payment(
+            forecast,
+            minimum,
+            [
+                (
+                    earliest,
+                    request.requested_amount,
+                )
+            ],
+        ):
+
+            return _make_decision(
+                request=request,
+                safe=safe,
+                status="affordable_later",
+                method=PaymentMethod.WAIT,
+                entries=entries,
+                earliest=earliest,
+                changes=(),
+                explanation=(
+                    "Waiting until the first projected date when "
+                    "the full payment can be made safely preserves "
+                    "the required minimum balance."
+                ),
+            )
+
+    # ------------------------------------------------------------
+    # 6. Not affordable
+    # ------------------------------------------------------------
+
+    return _make_decision(
+        request=request,
+        safe=safe,
+        status="not_affordable",
+        method=PaymentMethod.NOT_RECOMMENDED,
+        entries=(),
+        earliest=None,
+        changes=(),
+        explanation=(
+            "The full request cannot be completed safely within "
+            "the forecast period under the available payment "
+            "options and financial constraints."
+        ),
+    )
