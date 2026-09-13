@@ -1,193 +1,250 @@
-# HackerRank Orchestrate
+Buy or Wait? — AI Financial Affordability Agent
 
-Starter repository for the **HackerRank Orchestrate** 24-hour hackathon (September 2026).
+An AI-assisted financial affordability agent for the HackerRank Orchestrate September 2026 challenge.
 
-## Buy or Wait?
+The core design is deliberately split into two responsibilities:
 
-Build an AI-powered financial agent that decides whether a user can safely afford a requested expense.
+Gemini understands the request and unstructured evidence.
+The deterministic financial engine makes the affordability decision.
 
-A user may ask: **"Can I afford this laptop?"**
+This separation keeps the final financial decision reproducible, testable, and protected from LLM hallucination.
 
-Answering well takes more than the current balance. The agent must account for recurring expenses, pending payments, essential spending, confirmed income, available payment options, and relevant details buried in messages and images.
+1. Problem
 
-For every request, the agent decides whether the user should pay in full, pay partially, use installments, wait, or not proceed. The recommendation must be personalized: two users with the same balance can deserve different answers based on their commitments, priorities, payment preferences, and willingness to adjust flexible expenses.
+The agent evaluates whether a user can safely make a requested financial commitment while preserving required balances, protected/essential spending, known future cash flows, and any eligible payment options.
 
-A recommendation is safe only if the user can complete the full payment plan, cover essential expenses, and stay above their preferred minimum balance throughout the forecast period.
+For the benchmark dataset, the system produces one row per request in dataset/output.csv.
 
-Read [`problem_statement.md`](./problem_statement.md) for the full task spec, input/output schema, allowed values, conflict-resolution rules, and submission format.
+For the interactive demo, a user can describe their financial situation and purchase request in one natural-language message, for example:
 
----
+I have ZAR 30,000 in my account and want to keep ZAR 5,000 untouched. I'm considering a ZAR 33,114 laptop. I can pay it in 3 monthly installments.
 
-## Quick Start
+The demo extracts the financial facts, validates missing information, and sends the normalized state to the deterministic decision layer.
 
-Clone the repository and move into the project directory:
+2. Architecture
 
-```bash
-git clone https://github.com/interviewstreet/hackerrank-orchestrate-september26.git
-cd hackerrank-orchestrate-september26
-```
+                         ┌─────────────────────┐
+                         │   User / Dataset    │
+                         └──────────┬──────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │ Request + evidence  │
+                         │ retrieval/understand│
+                         └──────────┬──────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │       Gemini        │
+                         │ Understanding only │
+                         └──────────┬──────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │ Validation /        │
+                         │ normalization       │
+                         └──────────┬──────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │ Deterministic       │
+                         │ financial engine     │
+                         └──────────┬──────────┘
+                                    │
+                  ┌─────────────────┼─────────────────┐
+                  │                 │                 │
+          affordability      payment method    payment schedule
+                  │                 │                 │
+                  └─────────────────┼─────────────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │     output.csv      │
+                         └─────────────────────┘
 
-Build your solution in `code/main.py`, or use another language and document its entry point clearly.
+Gemini's role
 
-Your solution must:
+Gemini is used as an interpretation layer for natural language and unstructured evidence. It can identify facts such as amounts, descriptions, dates, and other request-related information.
 
-- Read the input files from `dataset/`
-- Generate one prediction for every request
-- Write the final predictions to `output.csv` in the repository root
+Gemini does not have final authority over affordability.
 
-Run the starter Python entry point with:
+Deterministic financial engine
 
-```bash
-python3 code/main.py
-```
+The deterministic engine is responsible for the financial decision. It evaluates the normalized financial state, protected minimum balance, projected cash flows, request amount, and eligible payment options.
 
-After running your solution, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request.
+This provides a stable decision boundary:
 
-## Important File Locations
+LLM -> interpretation
+Code -> financial decision
 
-```text
-dataset/        Input data and the blank output template. Do not modify the input data.
-code/           Your solution code.
-output.csv      Final generated predictions in the repository root.
-code.zip        ZIP file containing your complete solution for submission.
-```
+3. Guardrails
 
-The blank template at `dataset/output.csv` is provided as a reference. Your final generated file must be the root-level `output.csv`.
+The implementation uses several safeguards around the LLM layer:
 
----
+Financial decisions are not delegated to Gemini.
 
-## Repository Layout
+Missing essential financial information is requested instead of invented.
 
-```text
+Current balance and requested purchase amount are treated as separate concepts.
+
+A protected minimum balance is enforced.
+
+Currency consistency is checked before financial evaluation.
+
+Installment plans are considered only when a payment count is explicitly supplied.
+
+Financing fees are not invented when they are not explicitly available.
+
+Gemini/API failures can fall back to deterministic request understanding so the application remains usable.
+
+Benchmark output is validated for schema, row count, unique request IDs, non-negative safe amounts, and non-empty explanations.
+
+4. Benchmark datasets
+
+The challenge data is under dataset/ and includes:
+
+requests.csv
+
+financial_profiles.csv
+
+financial_events.csv
+
+request_payment_options.csv
+
+messages.csv
+
+images.csv
+
+exchange_rates.csv
+
+output.csv
+
+The required output schema is:
+
+request_id
+amount_safe_to_pay
+affordability_status
+recommended_payment_method
+payment_plan
+earliest_date_for_full_payment
+spending_changes_needed
+decision_explanation
+
+The output constraint is:
+
+0 <= amount_safe_to_pay <= requested_amount
+
+5. Interactive Gradio demo
+
+app.py provides two modes:
+
+Existing request
+
+Browse decisions generated for the benchmark requests.
+
+Ask your own request
+
+The user can provide financial state and the requested purchase in one natural-language message. Optional fields are available only as overrides/corrections.
+
+Example:
+
+I have ZAR 30,000 in my account and want to keep ZAR 5,000 untouched.
+I'm considering a ZAR 33,114 laptop.
+I can pay it in 3 monthly installments.
+
+The demo shows the detected financial state, safe amount, recommended method, payment plan, earliest full payment date, spending changes, and explanation.
+
+6. Setup
+
+Requirements
+
+Python 3.10+
+
+A Gemini API key for Gemini-powered request understanding
+
+Create and activate a virtual environment:
+
+python -m venv venv
+source venv/bin/activate
+
+Install dependencies:
+
+pip install -r requirements.txt
+
+Create .env from the example:
+
+cp .env.example .env
+
+Set:
+
+GEMINI_API_KEY=your_key_here
+GEMINI_MODEL=gemini-3.5-flash-lite
+
+Never commit .env or an API key.
+
+7. Run the application
+
+Launch the Gradio demo:
+
+python app.py
+
+The local interface is then available at:
+
+http://127.0.0.1:7860
+
+8. Run the benchmark pipeline
+
+The repository also contains the benchmark finance pipeline under code/.
+
+The final benchmark artifact is:
+
+dataset/output.csv
+
+The finance decision layer is deterministic so benchmark results can be reproduced without relying on an LLM to make the final decision.
+
+9. Gemini quota and failure handling
+
+The application treats Gemini as an external dependency rather than a single point of failure.
+
+The runtime architecture includes:
+
+server-side API-key loading
+
+caching of successful evidence extraction
+
+bounded request execution
+
+retry/backoff for transient failures
+
+quota/API failure detection
+
+deterministic fallback behavior
+
+This is especially important for free-tier/API quota exhaustion: the financial decision layer must continue to operate on whatever validated information is available rather than repeatedly retrying an exhausted provider quota.
+
+10. Project structure
+
 .
-├── AGENTS.md                         # Rules for AI coding tools + transcript logging
-├── problem_statement.md              # Full challenge statement
-├── README.md                         # You are here
-├── code/                             # Your solution code
-├── output.csv                        # Final generated predictions
-└── dataset/
-    ├── requests.csv                  # 250 requests to evaluate — predict these
-    ├── output.csv                    # Blank submission template
-    ├── sample_requests.csv           # 25 solved examples
-    ├── financial_profiles.csv        # Balances, minimum balance, priorities, preferences
-    ├── financial_events.csv          # Historical, pending, and confirmed transactions
-    ├── request_payment_options.csv   # Payment options available per request
-    ├── exchange_rates.csv            # Fixed, dated conversion rates
-    ├── messages.csv                  # Messages tied to users, requests, or events
-    ├── images.csv                    # Payroll letters, statements, bills, receipts
-    └── media/
-        └── images/
-```
+├── app.py
+├── code/
+│   ├── agents/
+│   │   ├── gemini/
+│   │   └── runtime/
+│   └── finance/
+│       └── v4/
+├── dataset/
+│   ├── requests.csv
+│   ├── financial_profiles.csv
+│   ├── financial_events.csv
+│   ├── request_payment_options.csv
+│   ├── messages.csv
+│   ├── images.csv
+│   ├── exchange_rates.csv
+│   └── output.csv
+├── .env.example
+├── .gitignore
+├── README.md
+└── requirements.txt
 
-Only `dataset/requests.csv` requires predictions. Everything else is context. Join user records with `user_id`, request records with `request_id`, supporting evidence with `related_event_id`, and exchange rates with the rate date and currency pair.
+11. Design principle
 
-Amounts are in the user's `home_currency` — the dataset uses INR, ZAR, IDR, USD, and EUR, and every conversion rate you need is in `exchange_rates.csv`. All dates are `YYYY-MM-DD`. Live exchange rates, market data, and banking access are not required.
+The central design decision is simple:
 
----
+Use AI where interpretation is difficult; use deterministic code where correctness matters.
 
-## What You Need to Build
-
-For every row in `dataset/requests.csv`, produce one row in `output.csv` with:
-
-| Column | Meaning |
-|---|---|
-| `request_id` | The request being answered |
-| `amount_safe_to_pay` | Largest amount safe to pay on `request_date` before optional spending changes, after protecting essentials and the minimum balance |
-| `affordability_status` | `affordable_now`, `affordable_with_plan`, `affordable_later`, or `not_affordable` |
-| `recommended_payment_method` | `full_payment`, `partial_payment`, `installments`, `wait`, or `not_recommended` |
-| `payment_plan` | Chronological `<YYYY-MM-DD>:<amount>` entries joined by `\|`, or `none` |
-| `earliest_date_for_full_payment` | Earliest date the full amount is forecast safe as one payment; empty if never within the forecast |
-| `spending_changes_needed` | Up to three `stop:<event_id>` / `reduce_to:<event_id>:<amount>` changes joined by `\|`, or `none` |
-| `decision_explanation` | Short explanation and the financial facts behind it |
-
-`0 <= amount_safe_to_pay <= requested_amount` must always hold. Installment plans must exactly match a supplied payment option, and only recurring expenses marked flexible may be changed.
-
-`affordable_with_plan` means the full request is completed through a partial-payment schedule, installments, or permitted spending changes. Recommend `partial_payment` only when the request allows it, the user accepts it, `0 < amount_safe_to_pay < requested_amount`, and `earliest_date_for_full_payment` is on or before `desired_completion_date`. Use exactly two payments: pay `amount_safe_to_pay` on `request_date`, then pay the remaining amount on `earliest_date_for_full_payment`. The two payments must add up to `requested_amount`. Unlike installments, partial payment does not need to match a supplied payment option.
-
----
-
-## Suggested Workflow
-
-1. Inspect `dataset/sample_requests.csv` — 25 requests with completed output columns — to understand the expected format and decision style.
-2. Reconstruct each user's financial state from `financial_profiles.csv` and `financial_events.csv`: separate recurring expenses from one-time events, reserve pending transactions, count confirmed salary only on its settlement date, and de-duplicate repeated representations of the same event.
-3. When an event has a blank `amount`, find its `event_id` as `related_event_id` in `images.csv` and extract the amount from the linked image. Never treat a blank amount as zero. Pull in any other relevant messages, images, and payment options for the request.
-4. Forecast forward and generate a plan that keeps the balance above the minimum at every step.
-5. Verify deterministically — bounds, plan feasibility, schedule match, flexible-only spending changes — before writing `output.csv`.
-6. Score yourself on the solved samples, then run the full dataset.
-
-You may use any language or runtime. Python, JavaScript, and TypeScript are all reasonable choices.
-
----
-
-## Requirements
-
-Your solution must:
-
-- be runnable from the terminal
-- read the provided files from `dataset/`
-- produce a valid `output.csv` with the exact required columns in the exact required order
-- include one prediction for every `request_id` in `dataset/requests.csv`
-- not use organizer-only files or hardcoded labels
-- keep behavior deterministic where possible
-
-If you use API keys or secrets, read them from environment variables. Never hardcode secrets in the repo.
-
----
-
-## Evaluation
-
-Your `output.csv` will be compared against hidden ground-truth values.
-
-The scoring will consider:
-
-- accuracy of `amount_safe_to_pay`
-- correctness of `affordability_status`
-- correctness of `recommended_payment_method` and `payment_plan`
-- accuracy of `earliest_date_for_full_payment`
-- validity of `spending_changes_needed`
-- usefulness and consistency of `decision_explanation`
-
-### Token Usage And Cost Analysis
-
-Your `code.zip` must include one token-usage file:
-
-```text
-evaluation/usage_report.md
-```
-
-The report must cover model providers and names, model calls, input and output tokens, total and average tokens per request, estimated total and per-request cost. The reported values must correspond to the final full-dataset run that produced your `output.csv`.
-
----
-
-## Chat Transcript Logging
-
-This repo includes an [`AGENTS.md`](./AGENTS.md) file for AI coding tools. It asks compatible tools to append conversation summaries to a `log.txt` in the repository root — the same directory as `AGENTS.md`:
-
-| Platform | Path |
-|---|---|
-| macOS / Linux | `<repo root>/log.txt` |
-| Windows | `<repo root>\log.txt` |
-
-The path resolves relative to `AGENTS.md`, so it stays correct across clones, renames, and checkouts. `log.txt` is gitignored — upload it as your chat transcript at submission time. Do not paste secrets into the chat.
-
-In case, the harness you are using is not in the repo root, you can explicitly ask the agent to look for the AGENTS.md in this folder & then continue.
-
----
-
-## Submission
-
-Submit the following files as instructed by HackerRank:
-
-| File | Description |
-|---|---|
-| `code.zip` | Full runnable solution, prompts/configuration, README, and the required `evaluation/` folder |
-| `output.csv` | Predictions for every row in `dataset/requests.csv` |
-| `chat_transcript` | The `log.txt` described above, showing how you developed or used the system |
-
-Before submitting, confirm:
-
-- `output.csv` has one row per row in `dataset/requests.csv` (250 rows plus the header).
-- `output.csv` has the exact required columns in the exact required order.
-- Every `amount_safe_to_pay` satisfies `0 <= amount_safe_to_pay <= requested_amount`.
-- Every installment plan matches a supplied payment option, and every spending change targets a flexible recurring expense.
-- Your runnable code, setup instructions, and `evaluation/` folder are included in `code.zip`.
+Gemini is useful for understanding language and unstructured evidence. The affordability decision remains deterministic so that the system can be tested, reasoned about, and defended during evaluation.
